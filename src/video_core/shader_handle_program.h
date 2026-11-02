@@ -3,7 +3,9 @@
 
 #pragma once
 
+#include <cstdlib>
 #include "common/common_types.h"
+#include "common/logging.h"
 #include "shader_recompiler/shader_info.h"
 #include "video_core/memory_manager.h"
 
@@ -31,6 +33,17 @@ u32 EvaluateTextureHandle(const Shader::Info& info, u32 program, Tegra::MemoryMa
                        return 0U;
                    }
                    const GPUVAddr base{gpu_memory.Read<u64>(cbuf + descriptor.cbuf_offset)};
+                   if (static const bool trace = std::getenv("EDEN_NX2_HANDLE_TRACE") != nullptr;
+                       trace && base != 0 && !gpu_memory.IsFullyMappedRange(base + offset, 4)) {
+                       static u32 logged{};
+                       if (logged++ < 24) {
+                           LOG_WARNING(HW_GPU,
+                                       "handle program: storage binding {} = c{}[{:#x}] (cbuf at {:#x}) "
+                                       "holds {:#x}, word at +{:#x} is unmapped",
+                                       binding, descriptor.cbuf_index, descriptor.cbuf_offset, cbuf,
+                                       base, offset);
+                       }
+                   }
                    return base != 0 ? gpu_memory.Read<u32>(base + offset) : 0U;
                })
         .value_or(0U);

@@ -4,7 +4,11 @@
 // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <cstdlib>
+#include <string>
 #include <optional>
+#include <vector>
 #include <unordered_map>
 
 #include <boost/container/flat_set.hpp>
@@ -375,6 +379,84 @@ std::optional<StorageBufferAddr> Track(const IR::Value& value, const Bias* bias)
     return BreadthFirstSearch(value, pred);
 }
 
+/// The constant buffer words (index, byte offset) a value is computed from, through phis, up to
+/// 256 instructions back. A 64-bit load counts for both of its words.
+void CollectCbufWords(const IR::Value& value, std::vector<StorageBufferAddr>& words,
+                      std::vector<const IR::Inst*>& visited) {
+    if (value.IsImmediate() || visited.size() >= 256) {
+        return;
+    }
+    const IR::Inst* const inst{value.InstRecursive()};
+    if (std::find(visited.begin(), visited.end(), inst) != visited.end()) {
+        return;
+    }
+    visited.push_back(inst);
+    const IR::Opcode opcode{inst->GetOpcode()};
+    if (opcode == IR::Opcode::GetCbufU32 || opcode == IR::Opcode::GetCbufU32x2) {
+        if (inst->Arg(0).IsImmediate() && inst->Arg(1).IsImmediate()) {
+            const u32 index{inst->Arg(0).U32()}, offset{inst->Arg(1).U32()};
+            words.push_back({.index = index, .offset = offset});
+            if (opcode == IR::Opcode::GetCbufU32x2) {
+                words.push_back({.index = index, .offset = offset + 4});
+            }
+        }
+        return;
+    }
+    for (size_t arg = 0; arg < inst->NumArgs(); ++arg) {
+        CollectCbufWords(inst->Arg(arg), words, visited);
+    }
+}
+
+/// When the low address word sums two constant buffer words (a table pointer and an offset, as
+/// UIMAD.WIDE pointer * 1 + offset lowers), the first one found may be the offset. The pointer is
+/// the word whose next word reaches the high address word: prefer that one.
+std::optional<StorageBufferAddr> TrackPointerPair(IR::Inst& inst) {
+    const IR::Value addr{inst.Arg(0)};
+    if (addr.IsImmediate()) {
+        return std::nullopt;
+    }
+    IR::Inst* addr_inst{addr.InstRecursive()};
+    if (addr_inst->GetOpcode() == IR::Opcode::IAdd64 && !addr_inst->Arg(0).IsImmediate()) {
+        addr_inst = addr_inst->Arg(0).InstRecursive();
+    }
+    if (addr_inst->GetOpcode() == IR::Opcode::PackUint2x32 && !addr_inst->Arg(0).IsImmediate()) {
+        addr_inst = addr_inst->Arg(0).InstRecursive();
+    }
+    if (addr_inst->GetOpcode() != IR::Opcode::CompositeConstructU32x2) {
+        return std::nullopt;
+    }
+    std::vector<StorageBufferAddr> low_words, high_words;
+    std::vector<const IR::Inst*> visited;
+    CollectCbufWords(addr_inst->Arg(0), low_words, visited);
+    visited.clear();
+    CollectCbufWords(addr_inst->Arg(1), high_words, visited);
+    if (static const bool trace = std::getenv("EDEN_NX2_HANDLE_TRACE") != nullptr; trace) {
+        std::string text;
+        for (const auto& w : low_words) text += fmt::format(" low c{}[{:#x}]", w.index, w.offset);
+        for (const auto& w : high_words) text += fmt::format(" high c{}[{:#x}]", w.index, w.offset);
+        LOG_INFO(Shader, "storage pointer candidates:{}", text);
+    }
+    // Only when the low word mixes words of more than one 64-bit pair: otherwise the usual
+    // search finds the same word.
+    bool mixed = false;
+    for (const StorageBufferAddr& low : low_words) {
+        mixed |= low.index != low_words.front().index || (low.offset & ~7U) != (low_words.front().offset & ~7U);
+    }
+    if (!mixed) {
+        return std::nullopt;
+    }
+    for (const StorageBufferAddr& low : low_words) {
+        if (!Common::IsAligned(low.offset, 8)) {
+            continue;
+        }
+        const StorageBufferAddr high{.index = low.index, .offset = low.offset + 4};
+        if (std::find(high_words.begin(), high_words.end(), high) != high_words.end()) {
+            return low;
+        }
+    }
+    return std::nullopt;
+}
+
 /// Collects the storage buffer used by a global memory instruction and the instruction itself
 void CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info) {
     // NVN puts storage buffers in a specific range, we have to bias towards these addresses to
@@ -407,8 +489,13 @@ void CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info) 
     };
     std::optional<StorageBufferAddr> storage_buffer{cached_track(&nvn_bias, info.biased_tracks)};
     if (!storage_buffer) {
-        // If it fails, track without a bias
-        storage_buffer = cached_track(nullptr, info.unbiased_tracks);
+        // If it fails, track without a bias, preferring the word whose high half the address uses
+        // Opt-in (EDEN_NX2_POINTER_PAIRS) until it is known safe for other programs.
+        static const bool pointer_pairs = std::getenv("EDEN_NX2_POINTER_PAIRS") != nullptr;
+        if (pointer_pairs) storage_buffer = TrackPointerPair(inst);
+        if (!storage_buffer) {
+            storage_buffer = cached_track(nullptr, info.unbiased_tracks);
+        }
         if (!storage_buffer) {
             // If that also fails, use NVN fallbacks
             LOG_WARNING(Shader, "Storage buffer failed to track, using global memory fallbacks");

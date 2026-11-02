@@ -2000,6 +2000,7 @@ private:
         system.GPU().RequestComposite(std::move(layers), std::move(fences));
         CaptureFrame();
         DumpRanges();
+        FillTexels();
         system.SpeedLimiter().DoSpeedLimiting(system.CoreTiming().GetGlobalTimeUs());
         system.GetPerfStats().EndSystemFrame();
         system.GetPerfStats().BeginSystemFrame();
@@ -2055,6 +2056,56 @@ private:
     // present, flush those GPU ranges back from the host GPU and save their bytes as
     // nx2-dump-<address>.bin in the EDEN_NX2_FRAME_CAPTURE directory (to inspect what a pass
     // rendered, e.g. a 3D volume, offline).
+    // EDEN_NX2_FILL_TEXEL=<from present>:<hex address>=r,g,b,a[;<hex address>=r,g,b,a...]: a debug
+    // override, not a fix. From that present on, write four floats at each GPU address (texel 0
+    // of a 1x1 RGBA32F image) every present and invalidate the range, so a value nothing writes
+    // can be replaced by a sane one to see what it changes.
+    void FillTexels() {
+        struct Fill { u64 address; std::array<float, 4> value; };
+        static const std::pair<u64, std::vector<Fill>> spec = [] {
+            std::pair<u64, std::vector<Fill>> parsed{~0ULL, {}};
+            const char* text = std::getenv("EDEN_NX2_FILL_TEXEL");
+            if (text == nullptr) return parsed;
+            char* end{};
+            parsed.first = std::strtoull(text, &end, 10);
+            while (*end == ':' || *end == ';') {
+                Fill fill{};
+                fill.address = std::strtoull(end + 1, &end, 16);
+                for (float& component : fill.value) {
+                    if (*end != '=' && *end != ',') break;
+                    component = std::strtof(end + 1, &end);
+                }
+                parsed.second.push_back(fill);
+            }
+            return parsed;
+        }();
+        if (spec.second.empty() || m_presents < spec.first) {
+            return;
+        }
+        for (const Fill& fill : spec.second) {
+            const bool first = m_presents == spec.first;
+            static_cast<void>(system.GPU().RunOnGpuThread([&system = system, fill, first] {
+                const auto device = Nvidia::Devices::Nx2GpuMemoryRegistry::Get().DeviceAddressOf(fill.address);
+                if (first) {
+                    std::array<float, 4> old{};
+                    if (device) {
+                        system.GPU().Renderer().ReadRasterizer()->FlushRegion(*device, sizeof(old));
+                        system.Host1x().MemoryManager().ReadBlock(*device, old.data(), sizeof(old));
+                    }
+                    LOG_INFO(Service, "nx2: texel at {:#x} ({}) held {} {} {} {}", fill.address,
+                             device ? "mapped" : "unmapped", old[0], old[1], old[2], old[3]);
+                }
+                if (device) {
+                    system.Host1x().MemoryManager().WriteBlock(*device, fill.value.data(), sizeof(fill.value));
+                    system.GPU().Renderer().ReadRasterizer()->InvalidateRegion(*device, sizeof(fill.value));
+                }
+            }));
+        }
+        if (m_presents == spec.first) {
+            LOG_INFO(Service, "nx2: filling {} texel(s) from present {}", spec.second.size(), spec.first);
+        }
+    }
+
     void DumpRanges() {
         static const std::string spec = [] {
             const char* text = std::getenv("EDEN_NX2_DUMP");

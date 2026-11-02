@@ -236,6 +236,26 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
         add_image(desc, desc.is_written);
     }
     texture_cache.FillImageViews(std::span(views.data(), views.size()), true);
+    // EDEN_NX2_IMAGE_TRACE: the storage images (and image buffers) a compute program binds, once
+    // per program and handle, to find what a pass writes.
+    if (static const bool image_trace = std::getenv("EDEN_NX2_IMAGE_TRACE") != nullptr; image_trace) {
+        static std::vector<std::pair<u64, u32>> logged;
+        const u64 program = (u64{kepler_compute.regs.code_loc.address_high} << 32) |
+                            kepler_compute.regs.code_loc.address_low;
+        for (size_t i = 0; i < views.size(); ++i) {
+            if (!views[i].blacklist || logged.size() >= 64) continue;
+            if (std::find(logged.begin(), logged.end(), std::make_pair(program, views[i].index)) != logged.end()) continue;
+            logged.emplace_back(program, views[i].index);
+            if (views[i].id == VideoCommon::NULL_IMAGE_VIEW_ID) {
+                LOG_INFO(HW_GPU, "image trace: program {:#x} handle {:#x} -> no image", program, views[i].index);
+                continue;
+            }
+            const auto& view = texture_cache.GetImageView(views[i].id);
+            LOG_INFO(HW_GPU, "image trace: program {:#x} handle {:#x} -> view {}x{} format {} at {:#x}",
+                     program, views[i].index, view.size.width, view.size.height,
+                     static_cast<u32>(view.format), view.gpu_addr);
+        }
+    }
 
     buffer_cache.UnbindComputeTextureBuffers();
     size_t index{};
