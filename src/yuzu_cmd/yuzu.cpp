@@ -41,8 +41,13 @@
 #include "core/file_sys/nup_writer.h"
 #include "core/file_sys/registered_cache.h"
 #include "core/file_sys/vfs/vfs_real.h"
+#include "core/arm/debug.h"
+#include "core/hle/kernel/k_process.h"
+#include "core/hle/kernel/k_readable_event.h"
+#include "core/hle/kernel/k_thread.h"
 #include "core/hle/service/am/applet_manager.h"
 #include "core/hle/service/filesystem/filesystem.h"
+#include "core/hle/service/kernel_helpers.h"
 #include "core/loader/loader.h"
 #include "frontend_common/config.h"
 #include "input_common/drivers/keyboard.h"
@@ -528,9 +533,83 @@ static void RunKeyScript(InputCommon::InputSubsystem& input_subsystem) {
     }
 }
 
+#ifdef GetObject
+#undef GetObject // windows.h
+#endif
+// EDEN_NX2_HANG_DUMP=<seconds>: once presents have stopped for that long, log every guest thread
+// of the application (state, wait reason, SVC arguments, wait handles, backtrace). Repeats every
+// 30 s while the stall lasts. A debug aid: reads thread state without the scheduler lock.
+static void RunHangDump(Core::System& system) {
+    static const double limit = [] {
+        const char* text = std::getenv("EDEN_NX2_HANG_DUMP");
+        return text ? std::atof(text) : 0.0;
+    }();
+    if (limit <= 0.0 || !system.IsPoweredOn()) {
+        return;
+    }
+    using Clock = std::chrono::steady_clock;
+    static u64 last_present = 0;
+    static Clock::time_point last_change = Clock::now();
+    static Clock::time_point last_dump{};
+    const u64 present = Core::g_nx2_present_count.load();
+    const auto now = Clock::now();
+    if (present != last_present) {
+        last_present = present;
+        last_change = now;
+        return;
+    }
+    if (present < 100 || std::chrono::duration<double>(now - last_change).count() < limit ||
+        (last_dump != Clock::time_point{} && last_dump > last_change &&
+         now - last_dump < std::chrono::seconds{30})) {
+        return;
+    }
+    last_dump = now;
+    auto* process = system.ApplicationProcess();
+    if (process == nullptr) {
+        return;
+    }
+    auto& kernel = system.Kernel();
+    auto& memory = process->GetMemory();
+    LOG_INFO(Frontend, "Hang dump: no present since {} for {:.0f} s", present,
+             std::chrono::duration<double>(now - last_change).count());
+    for (const auto& thread : process->GetThreadList()) {
+        const auto& ctx = thread.GetContext();
+        LOG_INFO(Frontend,
+                 "Hang dump: t{} '{}' prio {} core {} {} x0={:#x} x1={:#x} x2={:#x} x3={:#x} "
+                 "pc={:#x} lr={:#x} cv_key={:#x} arb_key={:#x} addr_key={:#x}",
+                 thread.GetThreadId(), Core::GetThreadName(&thread).value_or(""),
+                 thread.GetPriority(), thread.GetActiveCore(), Core::GetThreadState(&thread),
+                 ctx.r[0], ctx.r[1], ctx.r[2], ctx.r[3], ctx.pc, ctx.lr,
+                 thread.GetConditionVariableKey(), thread.GetAddressArbiterKey(),
+                 GetInteger(thread.GetAddressKey()));
+        if (thread.GetWaitReasonForDebugging() ==
+                Kernel::ThreadWaitReasonForDebugging::Synchronization &&
+            ctx.r[2] > 0 && ctx.r[2] <= 64 && memory.IsValidVirtualAddressRange(ctx.r[1], 4 * ctx.r[2])) {
+            std::string list;
+            for (u64 i = 0; i < ctx.r[2]; ++i) {
+                const u32 handle = memory.Read32(ctx.r[1] + 4 * i);
+                Kernel::KScopedAutoObject<Kernel::KReadableEvent> event =
+                    process->GetHandleTable().GetObject<Kernel::KReadableEvent>(kernel, handle);
+                list += fmt::format(" {:#x}{}", handle,
+                                    event.IsNotNull()
+                                        ? "=" + Service::KernelHelpers::DebugEventName(
+                                                    event.GetPointerUnsafe())
+                                        : std::string{});
+            }
+            LOG_INFO(Frontend, "Hang dump: t{} waits on{}", thread.GetThreadId(), list);
+        }
+        std::string frames;
+        for (const auto& entry : Core::GetBacktrace(&thread)) {
+            frames += fmt::format(" {:#x}", entry.original_address);
+        }
+        LOG_INFO(Frontend, "Hang dump: t{} stack{}", thread.GetThreadId(), frames);
+    }
+}
+
 extern "C" SDL_AppResult SDL_AppIterate(void *appstate) {
     SdlState *state = (SdlState *)appstate;
     RunKeyScript(state->input_subsystem);
+    RunHangDump(state->system);
     if (state->emu_window) {
         state->emu_window->ApplyPendingTitle();
     }
