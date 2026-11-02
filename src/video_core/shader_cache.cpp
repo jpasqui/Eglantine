@@ -24,6 +24,7 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/memory_manager.h"
+#include "video_core/nx2_vol_trace.h"
 #include "video_core/shader_cache.h"
 #include "video_core/shader_environment.h"
 #include "video_core/texture_cache/util.h"
@@ -129,6 +130,14 @@ bool ShaderCache::RefreshStages(std::array<u64, 6>& unique_hashes) try {
                     std::memcpy(config.data(), &shader_config, sizeof(config));
                     LOG_ERROR(HW_GPU, "Rejected program {:#x} is bound to stage {}: header {:08x}, slot {:08x}",
                               shader_addr, index, fmt::join(header, " "), fmt::join(config, " "));
+                    for (const auto& written :
+                         VideoCommon::Nx2VolTrace::WrittenBuffersOverlapping(shader_addr, 0x10000)) {
+                        LOG_ERROR(HW_GPU,
+                                  "Rejected program {:#x} (device {:#x}) overlaps image buffer {:#x} size {:#x} that "
+                                  "program {:#x} writes (first at {} ms, {} dispatches)",
+                                  shader_addr, *cpu_shader_addr, written.gpu_addr, written.size, written.program,
+                                  written.first_tick, written.dispatches);
+                    }
                 }
                 throw;
             }

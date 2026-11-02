@@ -493,6 +493,20 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         texture_cache.FillImageViews(std::span(views.data(), views.size()), false,
                                      Spec::has_images);
     }
+    if (VideoCommon::Nx2VolTrace::Enabled()) {
+        // The 3D images draws sample, each image once (and again when a handle maps elsewhere).
+        static std::set<std::tuple<u32, GPUVAddr, u32>> seen;
+        for (const auto& view_in : views) {
+            if (view_in.id == VideoCommon::NULL_IMAGE_VIEW_ID) continue;
+            const auto& view = texture_cache.GetImageView(view_in.id);
+            if (view.type != VideoCommon::ImageViewType::e3D) continue;
+            if (seen.size() < 512 && seen.insert({view_in.index, view.gpu_addr, view.image_id.index}).second &&
+                VideoCommon::Nx2VolTrace::Budget()) {
+                LOG_INFO(HW_GPU, "vol draw samples {:#x} image {} handle {:#x} format {}", view.gpu_addr,
+                         view.image_id.index, view_in.index, static_cast<u32>(view.format));
+            }
+        }
+    }
 
     VideoCommon::ImageViewInOut* texture_buffer_it{views.data()};
     const auto bind_stage_info{[&](size_t stage) LAMBDA_FORCEINLINE {

@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <thread>
@@ -380,13 +381,40 @@ private:
         page_begin = address;
         page_end = address;
         if (length >= sizeof(Instruction) && gpu_memory.IsFullyMappedRange(address, length)) {
+            // EDEN_NX2_CODE_TRACE: log code pages whose guest words the flush replaces (a cache
+            // that holds GPU-written data there downloads it over the guest memory).
+            static const bool code_trace = std::getenv("EDEN_NX2_CODE_TRACE") != nullptr;
+            if (code_trace) {
+                gpu_memory.ReadBlockUnsafe(address, unflushed.data(), length);
+            }
             gpu_memory.ReadBlock(address, page.data(), length);
+            if (code_trace && std::memcmp(unflushed.data(), page.data(), length) != 0) {
+                static std::atomic<u32> logged{};
+                if (logged.fetch_add(1, std::memory_order_relaxed) < 400) {
+                    size_t first = 0;
+                    while (std::memcmp(&unflushed[first], &page[first], sizeof(Instruction)) == 0) {
+                        ++first;
+                    }
+                    u32 before[4];
+                    u32 after[4];
+                    std::memcpy(before, &unflushed[first], sizeof(before));
+                    std::memcpy(after, &page[first], sizeof(after));
+                    LOG_WARNING(HW_GPU,
+                                "code trace: flush changed code at {:#x} (page read from {:#x}): "
+                                "guest {:08x} {:08x} {:08x} {:08x} -> flushed {:08x} {:08x} "
+                                "{:08x} {:08x}",
+                                address + first * sizeof(Instruction), address, before[0],
+                                before[1], before[2], before[3], after[0], after[1], after[2],
+                                after[3]);
+                }
+            }
             page_end = next_page;
         }
     }
 
     Tegra::MemoryManager& gpu_memory;
     std::array<Instruction, PageSize / sizeof(Instruction)> page;
+    std::array<Instruction, PageSize / sizeof(Instruction)> unflushed;
     GPUVAddr page_begin{};
     GPUVAddr page_end{};
 };

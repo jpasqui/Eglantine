@@ -8,7 +8,9 @@
 
 #include "common/algorithm.h"
 #include "common/assert.h"
+#include "common/logging.h"
 #include "video_core/engines/engine_upload.h"
+#include "video_core/nx2_vol_trace.h"
 #include "video_core/guest_memory.h"
 #include "video_core/memory_manager.h"
 #include "video_core/rasterizer_interface.h"
@@ -69,6 +71,13 @@ void State::ProcessData(const u32* data, size_t num_data) {
 
 void State::ProcessData(std::span<const u8> read_buffer) {
     const GPUVAddr address{regs.dest.Address()};
+    if (VideoCommon::Nx2VolTrace::Enabled() &&
+        VideoCommon::Nx2VolTrace::Overlaps(address, (std::max<u64>)(read_buffer.size(), 1)) &&
+        VideoCommon::Nx2VolTrace::Budget()) {
+        LOG_INFO(HW_GPU, "vol inline upload {:#x} {} lines {} length {} depth {}", address,
+                 is_linear ? "linear" : "block", regs.line_count, regs.line_length_in,
+                 regs.dest.depth);
+    }
     if (is_linear) {
         for (size_t line = 0; line < regs.line_count; ++line) {
             const GPUVAddr dest_line = address + line * regs.dest.pitch;

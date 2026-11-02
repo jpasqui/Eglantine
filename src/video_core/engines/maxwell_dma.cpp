@@ -15,6 +15,7 @@
 #include "video_core/engines/maxwell_dma.h"
 #include "video_core/guest_memory.h"
 #include "video_core/memory_manager.h"
+#include "video_core/nx2_vol_trace.h"
 #include "video_core/renderer_base.h"
 #include "video_core/textures/decoders.h"
 
@@ -88,6 +89,36 @@ void MaxwellDMA::Launch() {
             LOG_INFO(HW_GPU, "nx2 DMA {:#x} -> {:#x} lines={} length={} launch={:#x}",
                      static_cast<GPUVAddr>(regs.offset_in), GPUVAddr(regs.offset_out),
                      regs.line_count, regs.line_length_in, regs.reg_array[0xc0]);
+        }
+    }
+
+    if (VideoCommon::Nx2VolTrace::Enabled()) {
+        const bool dst_block = regs.launch_dma.dst_memory_layout.Value() != LaunchDMA::MemoryLayout::PITCH;
+        const bool src_block = regs.launch_dma.src_memory_layout.Value() != LaunchDMA::MemoryLayout::PITCH;
+        const u64 lines = regs.launch_dma.multi_line_enable ? (std::max)(regs.line_count, 1U) : 1U;
+        const u64 dst_size = dst_block ? u64{regs.dst_params.width} * regs.dst_params.height *
+                                             (std::max)(regs.dst_params.depth, 1U)
+                                       : u64{regs.line_length_in} * lines;
+        const u64 src_size = src_block ? u64{regs.src_params.width} * regs.src_params.height *
+                                             (std::max)(regs.src_params.depth, 1U)
+                                       : u64{regs.line_length_in} * lines;
+        const bool dst_hit = VideoCommon::Nx2VolTrace::Overlaps(regs.offset_out, (std::max)(dst_size, u64{1}));
+        const bool src_hit = VideoCommon::Nx2VolTrace::Overlaps(regs.offset_in, (std::max)(src_size, u64{1}));
+        if ((dst_hit || src_hit || (dst_block && regs.dst_params.depth > 1)) &&
+            VideoCommon::Nx2VolTrace::Budget()) {
+            LOG_INFO(HW_GPU,
+                     "vol dma {:#x}{} -> {:#x}{} {} lines {} length {} pitch {}/{} multi {} remap {} "
+                     "dst {}x{}x{} origin {},{},{} src {}x{}x{}",
+                     static_cast<GPUVAddr>(regs.offset_in), src_hit ? " (vol)" : "",
+                     GPUVAddr(regs.offset_out), dst_hit ? " (vol)" : "",
+                     src_block ? (dst_block ? "block->block" : "block->pitch")
+                               : (dst_block ? "pitch->block" : "pitch->pitch"),
+                     regs.line_count, regs.line_length_in, regs.pitch_in, regs.pitch_out,
+                     regs.launch_dma.multi_line_enable.Value(), regs.launch_dma.remap_enable.Value(),
+                     regs.dst_params.width, regs.dst_params.height, regs.dst_params.depth,
+                     regs.dst_params.origin.x.Value(), regs.dst_params.origin.y.Value(),
+                     regs.dst_params.layer, regs.src_params.width, regs.src_params.height,
+                     regs.src_params.depth);
         }
     }
 

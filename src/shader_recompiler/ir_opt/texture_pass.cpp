@@ -367,10 +367,9 @@ static inline bool IsTexturePixelFormatIntegerCached(Environment& env,
     return env.IsTexturePixelFormatInteger(GetTextureHandleCached(env, cbuf));
 }
 
-/// Whether the descriptor a handle program selects for this draw or dispatch has an integer
-/// format, as a constant buffer handle's is read from its descriptor; nothing when the program
+/// The handle a handle program computes from this environment's words; nothing when the program
 /// reads memory the environment can't provide.
-static std::optional<bool> HandleProgramIsInteger(Environment& env, const Info& info, u32 program) {
+static std::optional<u32> EvaluateHandleProgramNow(Environment& env, const Info& info, u32 program) {
     if (program >= info.handle_programs.size()) {
         return std::nullopt;
     }
@@ -394,11 +393,46 @@ static std::optional<bool> HandleProgramIsInteger(Environment& env, const Info& 
         if (!handle || missing) {
             return std::nullopt;
         }
-        return env.IsTexturePixelFormatInteger(*handle);
+        return handle;
     } catch (const std::exception&) {
         // A disk cache environment without these words
         return std::nullopt;
     }
+}
+
+/// Whether the descriptor a handle program selects for this draw or dispatch has an integer
+/// format, as a constant buffer handle's is read from its descriptor.
+static std::optional<bool> HandleProgramIsInteger(Environment& env, const Info& info, u32 program) {
+    try {
+        if (const std::optional<u32> handle = EvaluateHandleProgramNow(env, info, program)) {
+            return env.IsTexturePixelFormatInteger(*handle);
+        }
+    } catch (const std::exception&) {
+    }
+    return std::nullopt;
+}
+
+/// The type of the descriptor a handle program selects. On with EDEN_NX2_SURFACE_OPS (the
+/// programs that need it only run then) or EDEN_NX2_HANDLE_TYPES=1; EDEN_NX2_HANDLE_TYPES=0: off.
+/// Runs with it lost the device 2 times in 6 (cause not found), so it is not on by default.
+static std::optional<TextureType> HandleProgramTextureType(Environment& env, const Info& info,
+                                                           u32 program) {
+    static const bool handle_types = [] {
+        if (const char* text = std::getenv("EDEN_NX2_HANDLE_TYPES")) {
+            return std::string_view{text} != "0";
+        }
+        return std::getenv("EDEN_NX2_SURFACE_OPS") != nullptr;
+    }();
+    if (!handle_types) {
+        return std::nullopt;
+    }
+    try {
+        if (const std::optional<u32> handle = EvaluateHandleProgramNow(env, info, program)) {
+            return env.ReadTextureType(*handle);
+        }
+    } catch (const std::exception&) {
+    }
+    return std::nullopt;
 }
 
 static bool IsImageAtomic(IR::Opcode opcode) {
@@ -1325,6 +1359,16 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
                 inst->SetArg(4, IR::U32{});
             }
             if (flags.type != TextureType::Color1D) {
+                break;
+            }
+            if (cbuf.handle_program != ~0U) {
+                // A 1D fetch through a computed handle reads a texel buffer when the descriptor
+                // it selects is one (Pikmin 4's volumetric lightmap reads its brick requests so;
+                // as a 1D image every fetch returned zero and every brick went to cell 0).
+                if (HandleProgramTextureType(env, program.info, cbuf.handle_program) ==
+                    TextureType::Buffer) {
+                    flags.type.Assign(TextureType::Buffer);
+                }
                 break;
             }
             if (ReadTextureTypeCached(env, cbuf) == TextureType::Buffer) {

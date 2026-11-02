@@ -50,6 +50,7 @@
 #include "video_core/texture_cache/texture_cache_base.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
+#include "video_core/nx2_pending_writes.h"
 #include "video_core/nx2_profile.h"
 
 namespace Vulkan {
@@ -1041,6 +1042,29 @@ void RasterizerVulkan::FlushRegion(DAddr addr, u64 size, VideoCommon::CacheType 
     if (addr == 0 || size == 0) {
         return;
     }
+    // A guest CPU write to memory a cache holds GPU-written data for is collected and applied
+    // at the next gather. Downloads before then must leave the bytes it wrote alone, or the older
+    // GPU data lands over them (Pikmin 4 loads shader code into memory a compute pass wrote a
+    // moment before: the code was captured as garbage). See Nx2PendingWrites::Enabled.
+    const bool protect = VideoCommon::Nx2PendingWrites::Enabled();
+    VideoCommon::Nx2PendingWrites::Ranges pending;
+    bool gpu_written = false;
+    if (protect && True(which & VideoCommon::CacheType::BufferCache)) {
+        std::scoped_lock lock{buffer_cache.mutex};
+        gpu_written = buffer_cache.IsRegionGpuModified(addr, size);
+    }
+    if (protect && !gpu_written && True(which & VideoCommon::CacheType::TextureCache)) {
+        std::scoped_lock lock{texture_cache.mutex};
+        gpu_written = texture_cache.IsRegionGpuModified(addr, size);
+    }
+    if (gpu_written) {
+        gpu.ForEachPendingCpuWrite([&](PAddr pending_addr, size_t pending_size) {
+            if (pending_addr < addr + size && addr < pending_addr + pending_size) {
+                pending.emplace_back(pending_addr, pending_size);
+            }
+        });
+    }
+    const VideoCommon::Nx2PendingWrites::Scope pending_scope{pending.empty() ? nullptr : &pending};
     if (True(which & VideoCommon::CacheType::TextureCache)) {
         std::scoped_lock lock{texture_cache.mutex};
         texture_cache.DownloadMemory(addr, size);

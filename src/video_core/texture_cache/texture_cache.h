@@ -8,7 +8,9 @@
 
 #include <algorithm>
 #include <numeric>
+#include <cstdio>
 #include <cstdlib>
+#include <string>
 #include <limits>
 #include <array>
 #include <map>
@@ -34,6 +36,8 @@
 #include "video_core/texture_cache/util.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/nx2_pending_writes.h"
+#include "video_core/nx2_vol_trace.h"
 #include "video_core/textures/decoders.h"
 
 namespace VideoCommon {
@@ -44,6 +48,13 @@ using VideoCore::Surface::GetFormatType;
 using VideoCore::Surface::PixelFormat;
 using VideoCore::Surface::SurfaceType;
 using namespace Common::Literals;
+
+namespace Nx2VolTrace {
+template <typename ImageT>
+bool Traced(const ImageT& image) {
+    return Enabled() && image.info.type == ImageType::e3D && Budget();
+}
+} // namespace Nx2VolTrace
 
 template <class P>
 TextureCache<P>::TextureCache(Runtime& runtime_, Tegra::MaxwellDeviceMemoryManager& device_memory_)
@@ -274,6 +285,52 @@ void TextureCache<P>::ApplyThresholdOverrides(bool log) {
 
 template <class P>
 void TextureCache<P>::TickFrame() {
+    // EDEN_NX2_VOL_DUMP=<frame>,<dir>: at that frame, write the host contents (linear, as the
+    // cache holds them) of every 3D image of at least 16x16x16 to <dir>, without touching guest
+    // memory, to compare lightmap volumes between runs.
+    if (static const auto dump = [] {
+            std::pair<u64, std::string> result{};
+            if (const char* value = std::getenv("EDEN_NX2_VOL_DUMP")) {
+                const std::string text{value};
+                const size_t comma = text.find(',');
+                result.first = std::strtoull(text.substr(0, comma).c_str(), nullptr, 10);
+                result.second = comma == std::string::npos ? std::string{} : text.substr(comma + 1);
+            }
+            return result;
+        }();
+        dump.first != 0 && frame_tick == dump.first && gpu_memory != nullptr) {
+        std::vector<std::pair<u64, u64>> ranges;
+        {
+            std::scoped_lock lock{Nx2VolTrace::RangeMutex()};
+            ranges = Nx2VolTrace::Ranges();
+        }
+        std::set<u32> dumped;
+        for (const auto& [range_gpu, range_size] : ranges) {
+            const auto cpu = gpu_memory->GpuToCpuAddress(range_gpu);
+            if (!cpu) continue;
+            ForEachImageInRegion(*cpu, range_size, [&](ImageId image_id, Image& image) {
+                if (image.info.type != ImageType::e3D || image.info.size.width < 16 ||
+                    image.info.size.height < 5 || image.info.size.depth < 5 ||
+                    !dumped.insert(image_id.index).second ||
+                    True(image.flags & (ImageFlagBits::Unbacked | ImageFlagBits::Sparse))) {
+                    return;
+                }
+                auto map = runtime.DownloadStagingBuffer(image.unswizzled_size_bytes);
+                const auto copies = FullDownloadCopies(image.info);
+                image.DownloadMemory(map, copies);
+                runtime.Finish();
+                const std::string path = fmt::format(
+                    "{}/vol-{:x}-id{}-f{}-{}x{}x{}-flags{:x}.bin", dump.second, image.gpu_addr,
+                    image_id.index, static_cast<u32>(image.info.format), image.info.size.width,
+                    image.info.size.height, image.info.size.depth, static_cast<u32>(image.flags));
+                if (std::FILE* file = std::fopen(path.c_str(), "wb")) {
+                    std::fwrite(map.mapped_span.data(), 1, image.unswizzled_size_bytes, file);
+                    std::fclose(file);
+                }
+                LOG_INFO(HW_GPU, "vol dump {:#x} id {} -> {}", image.gpu_addr, image_id.index, path);
+            });
+        }
+    }
     // Upload buffers grown for one huge image (title 1's 341 MiB terrain layer pools) are freed
     // rather than kept for the rest of the session.
     for (auto* const scratch : {&swizzle_data_buffer, &unswizzle_data_buffer}) {
@@ -887,6 +944,12 @@ FramebufferId TextureCache<P>::GetFramebufferId(const RenderTargets& key) {
 template <class P>
 void TextureCache<P>::WriteMemory(DAddr cpu_addr, size_t size) {
     ForEachImageInRegion(cpu_addr, size, [this, cpu_addr, size](ImageId image_id, Image& image) {
+        if (Nx2VolTrace::Traced(image)) {
+            LOG_INFO(HW_GPU, "vol cpu write {:#x} id {} at {:+#x} size {:#x} flags {:#x} frame {}",
+                     image.gpu_addr, image_id.index,
+                     static_cast<s64>(cpu_addr) - static_cast<s64>(image.cpu_addr), size,
+                     static_cast<u32>(image.flags), frame_tick);
+        }
         if (True(image.flags & ImageFlagBits::UnwrittenSparse)) {
             // Written at last: a backed image replaces it where it is used next.
             image.flags |= ImageFlagBits::CpuModified | ImageFlagBits::Remapped;
@@ -931,6 +994,16 @@ void TextureCache<P>::DownloadMemory(DAddr cpu_addr, size_t size) {
     ForEachImageInRegion(cpu_addr, size, [this, &images](ImageId image_id, ImageBase& image) {
         if (!IsDownloadable(image)) {
             return;
+        }
+        // The CPU wrote here since the GPU did (or its write waits for the next gather): the
+        // GPU contents are stale, and swizzling them back would overwrite the CPU's data.
+        if ((Nx2PendingWrites::Enabled() && True(image.flags & ImageFlagBits::CpuModified)) ||
+            Nx2PendingWrites::Overlaps(image.cpu_addr, image.guest_size_bytes)) {
+            return;
+        }
+        if (Nx2VolTrace::Traced(image)) {
+            LOG_INFO(HW_GPU, "vol download {:#x} id {} flags {:#x} frame {}", image.gpu_addr,
+                     image_id.index, static_cast<u32>(image.flags), frame_tick);
         }
         image.flags &= ~ImageFlagBits::GpuModified;
         images.push_back(image_id);
@@ -1536,6 +1609,14 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
     if (False(image.flags & ImageFlagBits::CpuModified)) {
         // Only upload modified images
         return;
+    }
+    if (Nx2VolTrace::Traced(image)) {
+        std::vector<u8> guest(std::min<size_t>(image.guest_size_bytes, 64_MiB));
+        gpu_memory->ReadBlockUnsafe(image.gpu_addr, guest.data(), guest.size());
+        const auto digest = Nx2VolTrace::Hash(guest);
+        LOG_INFO(HW_GPU, "vol upload {:#x} id {} flags {:#x} guest hash {:016x} nonzero {} of {} frame {}",
+                 image.gpu_addr, image_id.index, static_cast<u32>(image.flags), digest.hash,
+                 digest.nonzero, guest.size(), frame_tick);
     }
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::TextureUpload};
 
@@ -2465,6 +2546,25 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
     }
     const ImageId new_image_id = slot_images.insert(runtime, new_info, gpu_addr, cpu_addr);
     Image& new_image = slot_images[new_image_id];
+    if (Nx2VolTrace::Enabled()) {
+        const bool is_3d = new_info.type == ImageType::e3D;
+        if (is_3d) {
+            Nx2VolTrace::AddRange(gpu_addr, new_image.guest_size_bytes);
+        }
+        if ((is_3d || Nx2VolTrace::Overlaps(gpu_addr, new_image.guest_size_bytes)) &&
+            Nx2VolTrace::Budget()) {
+            LOG_INFO(HW_GPU,
+                     "vol create {:#x} id {} type {} {}x{}x{} layers {} levels {} format {} size "
+                     "{:#x} joins {} left {} right {} bad {} ignore {} frame {}",
+                     gpu_addr, new_image_id.index, static_cast<u32>(new_info.type),
+                     new_info.size.width, new_info.size.height, new_info.size.depth,
+                     new_info.resources.layers, new_info.resources.levels,
+                     static_cast<u32>(new_info.format), new_image.guest_size_bytes,
+                     join_copies_to_do.size(), join_left_aliased_ids.size(),
+                     join_right_aliased_ids.size(), join_bad_overlap_ids.size(),
+                     join_ignore_textures.size(), frame_tick);
+        }
+    }
 
     new_image.allocation_tick = frame_tick;
     {
@@ -3171,6 +3271,10 @@ template <class P>
 void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
     ImageBase& image = slot_images[image_id];
     ++images_deleted;
+    if (Nx2VolTrace::Traced(image)) {
+        LOG_INFO(HW_GPU, "vol delete {:#x} id {} flags {:#x} frame {}", image.gpu_addr,
+                 image_id.index, static_cast<u32>(image.flags), frame_tick);
+    }
     // Drop every decode still queued for it, whatever IsDecoding says: an image re-decoded while
     // a decode was in flight has two, and the first to finish clears the flag. A decode left
     // behind was uploaded into the next image to take this slot (another texture's data: garbage
@@ -3328,6 +3432,10 @@ void TextureCache<P>::RemoveFramebuffers(std::span<const ImageViewId> removed_vi
 
 template <class P>
 void TextureCache<P>::MarkModification(ImageBase& image) noexcept {
+    if (False(image.flags & ImageFlagBits::GpuModified) && Nx2VolTrace::Traced(image)) {
+        LOG_INFO(HW_GPU, "vol gpu write {:#x} flags {:#x} frame {}", image.gpu_addr,
+                 static_cast<u32>(image.flags), frame_tick);
+    }
     image.flags |= ImageFlagBits::GpuModified;
     image.modification_tick = ++modification_tick;
 }
@@ -3389,6 +3497,10 @@ template <class P>
 void TextureCache<P>::PrepareImage(ImageId image_id, bool is_modification, bool invalidate) {
     Image& image = slot_images[image_id];
     if (invalidate) {
+        if (Nx2VolTrace::Traced(image)) {
+            LOG_INFO(HW_GPU, "vol invalidate {:#x} id {} flags {:#x} frame {}", image.gpu_addr,
+                     image_id.index, static_cast<u32>(image.flags), frame_tick);
+        }
         image.flags &= ~(ImageFlagBits::CpuModified | ImageFlagBits::GpuModified);
         if (False(image.flags & ImageFlagBits::Tracked)) {
             TrackImage(image, image_id);

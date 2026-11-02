@@ -17,6 +17,8 @@
 #include "common/range_sets.inc"
 #include "video_core/buffer_cache/buffer_cache_base.h"
 #include "video_core/guest_memory.h"
+#include "video_core/nx2_pending_writes.h"
+#include "video_core/nx2_vol_trace.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_profile.h"
@@ -175,6 +177,10 @@ void BufferCache<P>::UnmapGPUMemory(size_t as_id, GPUVAddr gpu_addr, size_t size
 
 template <class P>
 void BufferCache<P>::WriteMemory(DAddr device_addr, u64 size) {
+    if (VideoCommon::Nx2VolTrace::HitsWrittenDeviceRange(device_addr, size)) {
+        LOG_INFO(HW_GPU, "buffer trace: invalidate {:#x} size {:#x} gpu modified {}", device_addr,
+                 size, IsRegionGpuModified(device_addr, size));
+    }
     Nx2NoteListHostWrite(device_addr, size);
     if (IsRegionGpuModified(device_addr, size)) {
         ClearDownload(device_addr, size);
@@ -198,6 +204,10 @@ void BufferCache<P>::CachedWriteMemory(DAddr device_addr, u64 size) {
     }
 
     Nx2NoteListHostWrite(device_addr, size);
+    if (VideoCommon::Nx2VolTrace::HitsWrittenDeviceRange(device_addr, size)) {
+        LOG_INFO(HW_GPU, "buffer trace: cached cpu write {:#x} size {:#x} inlined into GPU-modified "
+                 "data", device_addr, size);
+    }
     tmp_buffer.resize_destructive(size);
     device_memory.ReadBlockUnsafe(device_addr, tmp_buffer.data(), size);
 
@@ -211,6 +221,16 @@ bool BufferCache<P>::OnCPUWrite(DAddr device_addr, u64 size) {
         return false;
     }
     if (memory_tracker.IsRegionGpuModified(device_addr, size)) {
+        if (VideoCommon::Nx2VolTrace::HitsWrittenDeviceRange(device_addr, size)) {
+            LOG_INFO(HW_GPU, "buffer trace: cpu write {:#x} size {:#x} on GPU-modified data, deferred "
+                     "(pending download {})", device_addr, size,
+                     [&] {
+                         bool pending = false;
+                         async_downloads.ForEachInRange(device_addr, size,
+                                                        [&](DAddr, DAddr, s32) { pending = true; });
+                         return pending;
+                     }());
+        }
         return true;
     }
     WriteMemory(device_addr, size);
@@ -266,6 +286,10 @@ bool BufferCache<P>::DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 am
         return false;
     }
 
+    if (VideoCommon::Nx2VolTrace::HitsWrittenDeviceRange(*cpu_dest_address, amount)) {
+        LOG_INFO(HW_GPU, "buffer trace: DMA copy {:#x} -> {:#x} size {:#x} (gpu {:#x} -> {:#x})",
+                 *cpu_src_address, *cpu_dest_address, amount, src_address, dest_address);
+    }
     ClearDownload(*cpu_dest_address, amount);
     MarkVertexBuffersStale(*cpu_dest_address, amount);
 
@@ -787,6 +811,10 @@ void BufferCache<P>::PopAsyncBuffers() {
         const u64 dst_offset = copy.dst_offset - base_offset;
         const u8* read_mapped_memory = base + dst_offset;
         async_downloads.ForEachInRange(device_addr, copy.size, [&](DAddr start, DAddr end, s32) {
+            if (VideoCommon::Nx2VolTrace::HitsWrittenDeviceRange(start, end - start)) {
+                LOG_INFO(HW_GPU, "buffer trace: async download {:#x} size {:#x} into guest memory",
+                         start, end - start);
+            }
             device_memory.WriteBlockUnsafe(start, &read_mapped_memory[start - device_addr],
                                            end - start);
         });
@@ -2362,14 +2390,20 @@ void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64
             // Undo the modified offset
             const u64 dst_offset = copy.dst_offset - download_staging.offset;
             const u8* copy_mapped_memory = mapped_memory + dst_offset;
-            device_memory.WriteBlockUnsafe(copy_device_addr, copy_mapped_memory, copy.size);
+            if (VideoCommon::Nx2VolTrace::HitsWrittenDeviceRange(copy_device_addr, copy.size)) {
+                LOG_INFO(HW_GPU, "buffer trace: download {:#x} size {:#x} into guest memory",
+                         copy_device_addr, copy.size);
+            }
+            VideoCommon::Nx2PendingWrites::WriteExceptPending(device_memory, copy_device_addr,
+                                                              copy_mapped_memory, copy.size);
         }
     } else {
         const std::span<u8> immediate_buffer = ImmediateBuffer(largest_copy);
         for (const BufferCopy& copy : copies) {
             buffer.ImmediateDownload(copy.src_offset, immediate_buffer.subspan(0, copy.size));
             const DAddr copy_device_addr = buffer.CpuAddr() + copy.src_offset;
-            device_memory.WriteBlockUnsafe(copy_device_addr, immediate_buffer.data(), copy.size);
+            VideoCommon::Nx2PendingWrites::WriteExceptPending(device_memory, copy_device_addr,
+                                                              immediate_buffer.data(), copy.size);
         }
     }
 }

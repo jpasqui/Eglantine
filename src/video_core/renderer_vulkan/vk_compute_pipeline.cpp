@@ -5,10 +5,13 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <array>
+#include <chrono>
 #include <vector>
 
 #include <boost/container/small_vector.hpp>
 #include <fmt/format.h>
+#include <fmt/ranges.h>
 
 #include "video_core/renderer_vulkan/pipeline_helper.h"
 #include "video_core/renderer_vulkan/pipeline_statistics.h"
@@ -18,6 +21,7 @@
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
+#include "video_core/nx2_vol_trace.h"
 #include "video_core/shader_handle_program.h"
 #include "video_core/shader_notify.h"
 #include "video_core/vulkan_common/vulkan_device.h"
@@ -236,6 +240,30 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
         add_image(desc, desc.is_written);
     }
     texture_cache.FillImageViews(std::span(views.data(), views.size()), true);
+    if (VideoCommon::Nx2VolTrace::Enabled()) {
+        // Each dispatch that reads or writes a 3D image: which ones, in order with the uploads.
+        size_t textures_begin = 0;
+        for (const auto& desc : info.texture_buffer_descriptors) textures_begin += desc.count;
+        for (const auto& desc : info.image_buffer_descriptors) textures_begin += desc.count;
+        size_t images_begin = textures_begin;
+        for (const auto& desc : info.texture_descriptors) images_begin += desc.count;
+        std::string touched;
+        for (size_t i = textures_begin; i < views.size(); ++i) {
+            if (views[i].id == VideoCommon::NULL_IMAGE_VIEW_ID) continue;
+            const auto& view = texture_cache.GetImageView(views[i].id);
+            if (view.type != VideoCommon::ImageViewType::e3D) continue;
+            touched += fmt::format(" {}{:#x}#{}/{}", i >= images_begin ? "w" : "r", view.gpu_addr,
+                                   view.image_id.index, static_cast<u32>(view.format));
+        }
+        static u64 dispatch{};
+        ++dispatch;
+        if (!touched.empty() && VideoCommon::Nx2VolTrace::Budget()) {
+            const u64 program = (u64{kepler_compute.regs.code_loc.address_high} << 32) |
+                                kepler_compute.regs.code_loc.address_low;
+            LOG_INFO(HW_GPU, "vol dispatch {} program {:#x} grid {}x{}x{}:{}", dispatch, program,
+                     qmd.grid_dim_x.Value(), qmd.grid_dim_y.Value(), qmd.grid_dim_z.Value(), touched);
+        }
+    }
     // EDEN_NX2_IMAGE_TRACE: the storage images (and image buffers) a compute program binds, once
     // per program and handle, to find what a pass writes.
     if (static const bool image_trace = std::getenv("EDEN_NX2_IMAGE_TRACE") != nullptr; image_trace) {
@@ -299,6 +327,30 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
                 // The handle selected no image (the null view has no format): bind it as words
                 // instead of aborting in the format table.
                 format = PixelFormat::R32_UINT;
+            }
+            if (static const bool image_trace = std::getenv("EDEN_NX2_IMAGE_TRACE") != nullptr;
+                image_trace && is_written && image_view.GpuAddr() != 0) {
+                const u64 program = (u64{kepler_compute.regs.code_loc.address_high} << 32) |
+                                    kepler_compute.regs.code_loc.address_low;
+                static const auto start = std::chrono::steady_clock::now();
+                const u64 ms = static_cast<u64>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                                    std::chrono::steady_clock::now() - start)
+                                                    .count());
+                if (VideoCommon::Nx2VolTrace::NoteWrittenBuffer(image_view.GpuAddr(),
+                                                                image_view.BufferSize(), program, ms)) {
+                    const auto device_addr = gpu_memory.GpuToCpuAddress(image_view.GpuAddr());
+                    if (device_addr) {
+                        VideoCommon::Nx2VolTrace::NoteWrittenDeviceRange(*device_addr,
+                                                                         image_view.BufferSize());
+                    }
+                    std::array<u32, 8> words{};
+                    gpu_memory.ReadBlockUnsafe(image_view.GpuAddr(), words.data(), sizeof(words));
+                    LOG_INFO(HW_GPU,
+                             "image trace: program {:#x} writes image buffer {:#x} (device {:#x}) size {:#x} handle "
+                             "{:#x}; guest words there now {:08x}",
+                             program, image_view.GpuAddr(), device_addr.value_or(0),
+                             image_view.BufferSize(), views[index].index, fmt::join(words, " "));
+                }
             }
             buffer_cache.BindComputeTextureBuffer(index, image_view.GpuAddr(),
                                                   image_view.BufferSize(), format,
