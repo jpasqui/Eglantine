@@ -435,14 +435,17 @@ std::shared_ptr<const LoweredNativeCode> GenericEnvironment::LowerNativeCode(u32
         if (status == Shader::Ampere::ProgramCaptureState::Result::Complete) break;
     }
     auto lowered = Shader::Ampere::LowerToMaxwell(native);
-    // EDEN_NX2_REJECT=<hex address>,...: treat these programs as rejected (to find which newly
+    // EDEN_NX2_REJECT=<hex address or program key>,...: treat these programs as rejected (to find which newly
     // lowered program changes a game's behaviour without rebuilding).
     if (static const std::string reject_list = [] {
             const char* text = std::getenv("EDEN_NX2_REJECT");
             return text ? "," + std::string{text} + "," : std::string{};
         }();
         !reject_list.empty() &&
-        reject_list.find(fmt::format(",{:x},", program_base)) != std::string::npos) {
+        (reject_list.find(fmt::format(",{:x},", program_base)) != std::string::npos ||
+         // or by program key, as in the EDEN_NX2_SHADER_DUMP names (stable across runs)
+         reject_list.find(fmt::format(",{:016x},", Shader::Ampere::NativeProgramKey(native))) !=
+             std::string::npos)) {
         throw Shader::RuntimeError("Native shader at {:#x} rejected by EDEN_NX2_REJECT", program_base);
     }
     // EDEN_NX2_SHADER_DUMP=<dir>: keep every captured native program (named by its key) so the

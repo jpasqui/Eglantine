@@ -416,7 +416,12 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
         // address); it fails the same way every frame.
         static std::unordered_map<u64, u32> failures;
         const u64 program = (u64{qmd[49]} << 32) | qmd[48];
-        if (failures[program ^ std::hash<std::string>{}(std::string{error})]++ >= 2) {
+        const u32 failed = ++failures[program ^ std::hash<std::string>{}(std::string{error})];
+        if (failed > 2) {
+            // Later failures are counted, so a trace shows which programs fail every frame.
+            if (failed == 100 || failed == 1000 || failed == 10000) {
+                LOG_WARNING(HW_GPU, "Native QMD failed {} times for program {:#x}: {}", failed, program, error);
+            }
             return true;
         }
         LOG_ERROR(HW_GPU, "Native QMD failed: {}", error);

@@ -61,7 +61,7 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
     for (const auto& instruction : code) {
         const u32 op = instruction.Bits(0, 12);
         uses_uniform_bank |= op == 0x3c4 || op == 0x2bd || op == 0x896 || op == 0xf60 || op == 0xc11 || op == 0xd08 || op == 0xc0c || op == 0x986 || op == 0x9a8 || op == 0xc12 || op == 0xc17 || op == 0xe24 || op == 0xc24 || op == 0xd00 || op == 0xd09 || op == 0x9c3 || op == 0xc45 || op == 0x2a4 || op == 0x891 || op == 0x890 || op == 0x290 || op == 0x28c || op == 0x88c || op == 0x287 || op == 0x887 || op == 0x958 || op == 0xab9 || op == 0xabb || op == 0x899 || op == 0xc20 || op == 0xe21 || op == 0xe23 || op == 0xc02 ||
-                             op == 0x886 || op == 0x3c2 || op == 0xc82 || op == 0x882 || op == 0x292 || op == 0x892 || op == 0x291 || op == 0x981 || op == 0xc13 || op == 0xc10 || op == 0xc23 || op == 0x526 || op == 0x2be || op == 0x8a4 || op == 0xd05 || (op == 0x984 && instruction.Bits(91, 1)) || op == 0x89c || op == 0x883 || op == 0x2a5 || op == 0xd06 || op == 0xf63 || op == 0xf69 || op == 0xc0b || op == 0x8a5 || op == 0x299 || op == 0xc09 || (op == 0x81c && instruction.Bits(67, 1)) || op == 0xc0a || op == 0xf66 || op == 0xf6f;
+                             op == 0x886 || op == 0x3c2 || op == 0xc82 || op == 0x882 || op == 0x292 || op == 0x892 || op == 0x291 || op == 0x981 || op == 0xc13 || op == 0xc10 || op == 0xc23 || op == 0x526 || op == 0x2be || op == 0x8a4 || op == 0xd05 || (op == 0x984 && instruction.Bits(91, 1)) || op == 0x89c || op == 0x883 || op == 0x2a5 || op == 0xd06 || op == 0xf63 || op == 0xf69 || op == 0xc0b || op == 0x8a5 || op == 0x299 || op == 0xc09 || (op == 0x81c && instruction.Bits(67, 1)) || op == 0xc0a || op == 0xf66 || op == 0xf6f || op == 0xf9b;
     }
     const auto address_of = [](u32 index) { return 0x50U + index * 8 + ((index + 1) / 3) * 8; };
     const auto fail = [&](u32 index, std::string_view reason) {
@@ -1129,6 +1129,57 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                 (u64{15} << 20) | (u64{dimension} << 33) |
                 (bindless ? u64{250} << 39 : (u64{offset} << 36) | (u64{1} << 51)));
             if (strong) emit(0xef98000000000000ULL | predicate | (u64{1} << 8));
+            break;
+        }
+        case 0x99c:   // SUST.P with the handle in a register (Mesa's SM70 OpSuSt: Rc at 64-71)
+        case 0xf9b: { // SUST.P with the handle in a uniform register at 40-45 (bit 91)
+            // Coordinates Ra 24-31, data Rb 32-39, dimension 61-63 (Mesa's image dims, which are
+            // Maxwell's SUST types), channel mask 72-75. 0xf9b is read as the uniform-handle form
+            // of 0xb9b, as 0xf6x are of 0xb6x: inferred from that pattern and the game's words
+            // (`00000f9b a0000a04 08100f00`), not from Mesa or a disassembler.
+            // Off unless EDEN_NX2_SURFACE_OPS is set: with these programs lowered, the game crashed (a
+            // storage image buffer whose handle resolved to no image, format Invalid) or aborted
+            // after reading handles at unmapped addresses (Pikmin 4 demo); the lowering itself checks out offline.
+            if (!std::getenv("EDEN_NX2_SURFACE_OPS")) return fail(index, "unsupported native opcode");
+            const bool uniform = opcode == 0xf9b;
+            const u32 data = insn.Bits(32, 8), coordinate = insn.Bits(24, 8);
+            const u32 dimension = insn.Bits(61, 3);
+            const u32 handle = uniform ? uniform_register(insn.Bits(40, 6)) : insn.Bits(64, 8);
+            const u32 coordinates = dimension == 5 || dimension == 4 ? 3U : dimension == 3 || dimension == 2 ? 2U : 1U;
+            const u32 rest = insn.words[2] & ~(uniform ? 0U : 0xffU);
+            const bool strong = rest == (uniform ? 0x0810af00U : 0x0010af00U);
+            if ((rest != (uniform ? 0x08100f00U : 0x00100f00U) && !strong) || dimension > 5 ||
+                (uniform ? (insn.Bits(46, 15) || (insn.Bits(64, 8) != 0 && insn.Bits(64, 8) != 255))
+                         : insn.Bits(40, 21)) ||
+                handle == ~0U || handle >= 246 || data > 242 || coordinate == 255 ||
+                coordinate + coordinates > 246)
+                return fail(index, "native bindless formatted surface store mode");
+            if (uniform) {
+                emit(0x5c98000000070000ULL | 250 | (u64{15} << 39) | (u64{handle} << 20));
+            }
+            if (strong) emit(0xef98000000000000ULL | predicate | (u64{1} << 8)); // MEMBAR.GL
+            // Maxwell SUST.P.B: data 0-7, coordinates 8-15, mask 20-23, type 33-35, handle 39-46.
+            emit(0xeb20000000000000ULL | predicate | data | (u64{coordinate} << 8) |
+                 (u64{15} << 20) | (u64{dimension} << 33) | (u64{uniform ? 250U : handle} << 39));
+            if (strong) emit(0xef98000000000000ULL | predicate | (u64{1} << 8));
+            break;
+        }
+        case 0x394: { // SUATOM with a result, the handle in a register (Mesa's SM70 OpSuAtom).
+            // Dest 16-23, coordinates Ra 24-31, data Rb 32-39, handle Rc 64-71, dimension 61-63,
+            // .BA 72, type 73-75 (U32 0, S32 1), order 77-80, fault 81-83, op 87-90 (ADD..EXCH as
+            // Maxwell's). Maxwell SUATOM.B: dest 0-7, coordinates 8-15, operand 20-27, op 29-32,
+            // type 33-35, handle 39-46, size 51-53, bindless 54.
+            if (!std::getenv("EDEN_NX2_SURFACE_OPS")) return fail(index, "unsupported native opcode");
+            const u32 data = insn.Bits(32, 8), coordinate = insn.Bits(24, 8), handle = insn.Bits(64, 8);
+            const u32 dimension = insn.Bits(61, 3), type = insn.Bits(73, 3), operation = insn.Bits(87, 4);
+            const u32 coordinates = dimension == 5 || dimension == 4 ? 3U : dimension == 3 || dimension == 2 ? 2U : 1U;
+            if (insn.Bits(40, 21) || dimension > 5 || insn.Bits(72, 1) || type > 1 || insn.Bits(76, 1) ||
+                insn.Bits(81, 3) != 7 || operation > 8 || insn.Bits(91, 1) || handle >= 246 ||
+                data >= 246 || coordinate == 255 || coordinate + coordinates > 246)
+                return fail(index, "native bindless surface atomic mode");
+            emit(0xea00000000000000ULL | predicate | dest | (u64{coordinate} << 8) | (u64{data} << 20) |
+                 (u64{operation} << 29) | (u64{dimension} << 33) | (u64{handle} << 39) |
+                 (u64{type} << 51) | (u64{1} << 54));
             break;
         }
         case 0x59f: { // SURED.D.2D.ADD.STRONG.GPU.IGN U32, direct descriptor (title 1's race compute).
