@@ -239,21 +239,43 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     // EDEN_NX2_IMAGE_TRACE: the storage images (and image buffers) a compute program binds, once
     // per program and handle, to find what a pass writes.
     if (static const bool image_trace = std::getenv("EDEN_NX2_IMAGE_TRACE") != nullptr; image_trace) {
-        static std::vector<std::pair<u64, u32>> logged;
+        static std::vector<std::pair<u64, size_t>> logged;
         const u64 program = (u64{kepler_compute.regs.code_loc.address_high} << 32) |
                             kepler_compute.regs.code_loc.address_low;
+        // views: texture buffers, image buffers, textures, images (in that order).
+        const size_t image_buffers_begin = info.texture_buffer_descriptors.size();
+        const size_t textures_begin = image_buffers_begin + info.image_buffer_descriptors.size();
+        size_t images_begin = textures_begin;
+        for (const auto& desc : info.texture_descriptors) images_begin += desc.count;
+        if (std::none_of(logged.begin(), logged.end(), [&](const auto& e) { return e.first == program; }) &&
+            logged.size() < 256) {
+            for (size_t s = 0; s < info.storage_buffers_descriptors.size(); ++s) {
+                const auto& sb = info.storage_buffers_descriptors[s];
+                const GPUVAddr cbuf = sb.cbuf_index < cbufs.size() ? cbufs[sb.cbuf_index].Address() : 0;
+                LOG_INFO(HW_GPU, "image trace: program {:#x} storage {} = c{}[{:#x}] holds {:#x}{}",
+                         program, s, sb.cbuf_index, sb.cbuf_offset,
+                         cbuf ? gpu_memory.Read<u64>(cbuf + sb.cbuf_offset) : 0,
+                         sb.is_written ? " (written)" : "");
+            }
+        }
         for (size_t i = 0; i < views.size(); ++i) {
-            if (!views[i].blacklist || logged.size() >= 64) continue;
-            if (std::find(logged.begin(), logged.end(), std::make_pair(program, views[i].index)) != logged.end()) continue;
-            logged.emplace_back(program, views[i].index);
+            const bool image_buffer = i >= image_buffers_begin && i < textures_begin;
+            const bool image = i >= images_begin;
+            if ((!image_buffer && !image) || logged.size() >= 256) continue;
+            if (std::find(logged.begin(), logged.end(), std::make_pair(program, i)) != logged.end()) continue;
+            logged.emplace_back(program, i);
+            const auto& desc_integer = image ? info.image_descriptors[std::min(i - images_begin, info.image_descriptors.size() - 1)].is_integer
+                                             : info.image_buffer_descriptors[i - image_buffers_begin].is_integer;
             if (views[i].id == VideoCommon::NULL_IMAGE_VIEW_ID) {
-                LOG_INFO(HW_GPU, "image trace: program {:#x} handle {:#x} -> no image", program, views[i].index);
+                LOG_INFO(HW_GPU, "image trace: program {:#x} {} {} handle {:#x} -> no image", program,
+                         image ? "image" : "image buffer", i, views[i].index);
                 continue;
             }
             const auto& view = texture_cache.GetImageView(views[i].id);
-            LOG_INFO(HW_GPU, "image trace: program {:#x} handle {:#x} -> view {}x{} format {} at {:#x}",
-                     program, views[i].index, view.size.width, view.size.height,
-                     static_cast<u32>(view.format), view.gpu_addr);
+            LOG_INFO(HW_GPU, "image trace: program {:#x} {} {} handle {:#x} shader integer {} -> view {}x{}x{} format {} integer {} at {:#x}",
+                     program, image ? "image" : "image buffer", i, views[i].index, desc_integer,
+                     view.size.width, view.size.height, view.size.depth, static_cast<u32>(view.format),
+                     VideoCore::Surface::IsPixelFormatInteger(view.format), view.gpu_addr);
         }
     }
 
@@ -272,6 +294,11 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
                 if (const auto explicit_format{PixelFormatFromImageFormat(desc.format)}) {
                     format = *explicit_format;
                 }
+            }
+            if (format == PixelFormat::Invalid) {
+                // The handle selected no image (the null view has no format): bind it as words
+                // instead of aborting in the format table.
+                format = PixelFormat::R32_UINT;
             }
             buffer_cache.BindComputeTextureBuffer(index, image_view.GpuAddr(),
                                                   image_view.BufferSize(), format,

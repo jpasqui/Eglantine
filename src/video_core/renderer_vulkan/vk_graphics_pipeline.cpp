@@ -511,6 +511,9 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                         format = *explicit_format;
                     }
                 }
+                if (format == PixelFormat::Invalid) {
+                    format = PixelFormat::R32_UINT; // no image behind the handle (null view)
+                }
                 buffer_cache.BindGraphicsTextureBuffer(stage, index, image_view.GpuAddr(),
                                                        image_view.BufferSize(), format,
                                                        is_written, is_image);

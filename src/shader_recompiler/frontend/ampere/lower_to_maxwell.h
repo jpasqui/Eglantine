@@ -46,6 +46,16 @@ struct LoweredProgram {
 // Lower only operations whose semantics are representable by the existing
 // Maxwell frontend. These are new instructions, not reinterpretations of the
 // native bytes. Scheduling/control words are added by the environment adapter.
+/// SUST.P/SUATOM with a register or uniform-register handle (0x99c, 0xf9b, 0x394) are lowered
+/// only with EDEN_NX2_SURFACE_OPS set (not "0").
+inline bool SurfaceOpsEnabled() {
+    static const bool enabled = [] {
+        const char* text = std::getenv("EDEN_NX2_SURFACE_OPS");
+        return text && text[0] != '0';
+    }();
+    return enabled;
+}
+
 inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 high_uniforms) {
     LoweredProgram result;
     // UR28 and up (when used) live just below R216: UR28 at R(216 - high_uniforms).
@@ -1148,10 +1158,10 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             // Maxwell's SUST types), channel mask 72-75. 0xf9b is read as the uniform-handle form
             // of 0xb9b, as 0xf6x are of 0xb6x: inferred from that pattern and the game's words
             // (`00000f9b a0000a04 08100f00`), not from Mesa or a disassembler.
-            // Off unless EDEN_NX2_SURFACE_OPS is set: with these programs lowered, the game crashed (a
-            // storage image buffer whose handle resolved to no image, format Invalid) or aborted
-            // after reading handles at unmapped addresses (Pikmin 4 demo); the lowering itself checks out offline.
-            if (!std::getenv("EDEN_NX2_SURFACE_OPS")) return fail(index, "unsupported native opcode");
+            // Opt-in (EDEN_NX2_SURFACE_OPS): in the Pikmin 4 demo the programs now write the right
+            // data, but the result still varies between runs (lightmap bricks left black in some,
+            // and draws whose captured vertex programs are garbage in others).
+            if (!SurfaceOpsEnabled()) return fail(index, "unsupported native opcode");
             const bool uniform = opcode == 0xf9b;
             const u32 data = insn.Bits(32, 8), coordinate = insn.Bits(24, 8);
             const u32 dimension = insn.Bits(61, 3);
@@ -1180,7 +1190,7 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             // .BA 72, type 73-75 (U32 0, S32 1), order 77-80, fault 81-83, op 87-90 (ADD..EXCH as
             // Maxwell's). Maxwell SUATOM.B: dest 0-7, coordinates 8-15, operand 20-27, op 29-32,
             // type 33-35, handle 39-46, size 51-53, bindless 54.
-            if (!std::getenv("EDEN_NX2_SURFACE_OPS")) return fail(index, "unsupported native opcode");
+            if (!SurfaceOpsEnabled()) return fail(index, "unsupported native opcode");
             const u32 data = insn.Bits(32, 8), coordinate = insn.Bits(24, 8), handle = insn.Bits(64, 8);
             const u32 dimension = insn.Bits(61, 3), type = insn.Bits(73, 3), operation = insn.Bits(87, 4);
             const u32 coordinates = dimension == 5 || dimension == 4 ? 3U : dimension == 3 || dimension == 2 ? 2U : 1U;

@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <string>
+#include <string_view>
 #include <optional>
 #include <vector>
 #include <unordered_map>
@@ -416,9 +417,11 @@ void CollectCbufWords(const IR::Value& value, std::vector<StorageBufferAddr>& wo
 }
 
 /// When the low address word sums two constant buffer words (a table pointer and an offset, as
-/// UIMAD.WIDE pointer * 1 + offset lowers), the first one found may be the offset. The pointer is
-/// the word whose next word reaches the high address word: prefer that one.
-std::optional<StorageBufferAddr> TrackPointerPair(IR::Inst& inst) {
+/// UIMAD.WIDE pointer * 1 + offset lowers), the first one found may be the offset. A base is a
+/// 64-bit pair, so the pointer is the word whose next word reaches the high address word. Returns
+/// that word when `chosen` (the usual search's pick) is missing or its high half is not used.
+std::optional<StorageBufferAddr> TrackPointerPair(IR::Inst& inst,
+                                                  std::optional<StorageBufferAddr> chosen) {
     const IR::Value addr{inst.Arg(0)};
     if (addr.IsImmediate()) {
         return std::nullopt;
@@ -438,12 +441,6 @@ std::optional<StorageBufferAddr> TrackPointerPair(IR::Inst& inst) {
     CollectCbufWords(addr_inst->Arg(0), low_words, visited);
     visited.clear();
     CollectCbufWords(addr_inst->Arg(1), high_words, visited);
-    if (static const bool trace = std::getenv("EDEN_NX2_HANDLE_TRACE") != nullptr; trace) {
-        std::string text;
-        for (const auto& w : low_words) text += fmt::format(" low c{}[{:#x}]", w.index, w.offset);
-        for (const auto& w : high_words) text += fmt::format(" high c{}[{:#x}]", w.index, w.offset);
-        LOG_INFO(Shader, "storage pointer candidates:{}", text);
-    }
     // Only when the low word mixes words of more than one 64-bit pair: otherwise the usual
     // search finds the same word.
     bool mixed = false;
@@ -453,16 +450,35 @@ std::optional<StorageBufferAddr> TrackPointerPair(IR::Inst& inst) {
     if (!mixed) {
         return std::nullopt;
     }
-    for (const StorageBufferAddr& low : low_words) {
-        if (!Common::IsAligned(low.offset, 8)) {
-            continue;
-        }
+    const auto high_used = [&](const StorageBufferAddr& low) {
         const StorageBufferAddr high{.index = low.index, .offset = low.offset + 4};
-        if (std::find(high_words.begin(), high_words.end(), high) != high_words.end()) {
-            return low;
+        return Common::IsAligned(low.offset, 8) &&
+               std::find(high_words.begin(), high_words.end(), high) != high_words.end();
+    };
+    // A 64-bit offset added to a 64-bit pointer uses both high halves. NVN keeps buffer
+    // addresses in the driver's constant buffer 0 (as the NVN bias above assumes), and an
+    // application's buffer holds the offset: then the pair in buffer 0 is the base.
+    std::optional<StorageBufferAddr> found;
+    for (const StorageBufferAddr& low : low_words) {
+        if (high_used(low) && (!found || (found->index != 0 && low.index == 0))) {
+            found = low;
         }
     }
-    return std::nullopt;
+    const bool keep = !found || (chosen && *chosen == *found) ||
+                      (chosen && high_used(*chosen) && (chosen->index == 0 || found->index != 0));
+    if (static const bool trace = std::getenv("EDEN_NX2_HANDLE_TRACE") != nullptr; trace) {
+        std::string text;
+        for (const auto& w : low_words) text += fmt::format(" low c{}[{:#x}]", w.index, w.offset);
+        for (const auto& w : high_words) text += fmt::format(" high c{}[{:#x}]", w.index, w.offset);
+        LOG_INFO(Shader, "storage pointer pair: search took {}, pair {}, using {}:{}",
+                 chosen ? fmt::format("c{}[{:#x}]", chosen->index, chosen->offset) : "nothing",
+                 found ? fmt::format("c{}[{:#x}]", found->index, found->offset) : "none",
+                 keep ? "search" : "pair", text);
+    }
+    if (keep) {
+        return std::nullopt;
+    }
+    return found;
 }
 
 /// Collects the storage buffer used by a global memory instruction and the instruction itself
@@ -497,12 +513,17 @@ void CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info) 
     };
     std::optional<StorageBufferAddr> storage_buffer{cached_track(&nvn_bias, info.biased_tracks)};
     if (!storage_buffer) {
-        // If it fails, track without a bias, preferring the word whose high half the address uses
-        // Opt-in (EDEN_NX2_POINTER_PAIRS) until it is known safe for other programs.
-        static const bool pointer_pairs = std::getenv("EDEN_NX2_POINTER_PAIRS") != nullptr;
-        if (pointer_pairs) storage_buffer = TrackPointerPair(inst);
-        if (!storage_buffer) {
-            storage_buffer = cached_track(nullptr, info.unbiased_tracks);
+        // If it fails, track without a bias. When the word found is not the low half of the
+        // address's 64-bit base, take the word that is (EDEN_NX2_POINTER_PAIRS=0 turns it off).
+        storage_buffer = cached_track(nullptr, info.unbiased_tracks);
+        static const bool pointer_pairs = [] {
+            const char* text = std::getenv("EDEN_NX2_POINTER_PAIRS");
+            return !text || std::string_view{text} != "0";
+        }();
+        if (pointer_pairs) {
+            if (const auto pair = TrackPointerPair(inst, storage_buffer)) {
+                storage_buffer = pair;
+            }
         }
         if (!storage_buffer) {
             // If that also fails, use NVN fallbacks

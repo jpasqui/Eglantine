@@ -62,6 +62,8 @@ public:
 
     [[nodiscard]] u32 TranslateProgramAddress(u32 address) const override;
 
+    [[nodiscard]] std::optional<u32> ReadGlobalU32(u64 gpu_addr) final;
+
     [[nodiscard]] std::optional<u64> Analyze();
 
     void SetCachedSize(size_t size_bytes);
@@ -213,6 +215,8 @@ public:
     [[nodiscard]] Shader::TexturePixelFormat ReadTexturePixelFormat(u32 handle) override;
 
     [[nodiscard]] bool IsTexturePixelFormatInteger(u32 handle) override;
+
+    [[nodiscard]] std::optional<u32> ReadGlobalU32(u64 gpu_addr) override;
 
     [[nodiscard]] u32 ReadViewportTransformState() override;
 

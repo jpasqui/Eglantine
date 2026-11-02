@@ -174,6 +174,21 @@ u32 GenericEnvironment::TranslateProgramAddress(u32 address) const {
     return address;
 }
 
+// Words of GPU memory a shader's handle table holds are kept with the constant buffer words, under
+// keys no constant buffer index reaches, so a pipeline loaded from the disk cache reads them too.
+static u64 MakeGlobalKey(u64 gpu_addr) {
+    return MakeCbufKey(0x80000000U | static_cast<u32>(gpu_addr >> 32), static_cast<u32>(gpu_addr));
+}
+
+std::optional<u32> GenericEnvironment::ReadGlobalU32(u64 gpu_addr) {
+    if (gpu_addr == 0 || !gpu_memory->IsFullyMappedRange(gpu_addr, sizeof(u32))) {
+        return std::nullopt;
+    }
+    const u32 value{gpu_memory->Read<u32>(gpu_addr)};
+    cbuf_values.emplace(MakeGlobalKey(gpu_addr), value);
+    return value;
+}
+
 std::optional<u64> GenericEnvironment::Analyze() {
     if (native_source_size) {
         // Include the converted header and a version tag to isolate this experimental ABI.
@@ -838,6 +853,14 @@ u64 FileEnvironment::ReadInstruction(u32 address) {
         throw Shader::LogicError("Out of bounds address {}", address);
     }
     return code[(address - read_lowest) / sizeof(u64)];
+}
+
+std::optional<u32> FileEnvironment::ReadGlobalU32(u64 gpu_addr) {
+    const auto it{cbuf_values.find(MakeGlobalKey(gpu_addr))};
+    if (it == cbuf_values.end()) {
+        return std::nullopt;
+    }
+    return it->second;
 }
 
 u32 FileEnvironment::ReadCbufValue(u32 cbuf_index, u32 cbuf_offset) {

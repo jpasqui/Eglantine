@@ -12,10 +12,14 @@
 #include <bit>
 #include <optional>
 #include "common/container/unordered_map.h"
+#include <cstdlib>
+#include <exception>
+#include <string_view>
 #include <tuple>
 #include <limits>
 #include <boost/container/small_vector.hpp>
 
+#include "common/logging.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "shader_recompiler/environment.h"
@@ -361,6 +365,59 @@ static inline bool IsTexturePixelFormatIntegerCached(Environment& env,
                                                         const ConstBufferAddr& cbuf) {
     if (cbuf.handle_program != ~0U) return false;
     return env.IsTexturePixelFormatInteger(GetTextureHandleCached(env, cbuf));
+}
+
+/// Whether the descriptor a handle program selects for this draw or dispatch has an integer
+/// format, as a constant buffer handle's is read from its descriptor; nothing when the program
+/// reads memory the environment can't provide.
+static std::optional<bool> HandleProgramIsInteger(Environment& env, const Info& info, u32 program) {
+    if (program >= info.handle_programs.size()) {
+        return std::nullopt;
+    }
+    bool missing = false;
+    try {
+        const std::optional<u32> handle = EvaluateHandleProgram(
+            info.handle_programs[program],
+            [&](u32 index, u32 offset) { return env.ReadCbufValue(index, offset); },
+            [&](u32 binding, u32 offset) -> u32 {
+                if (binding >= info.storage_buffers_descriptors.size()) {
+                    missing = true;
+                    return 0;
+                }
+                const auto& desc{info.storage_buffers_descriptors[binding]};
+                const u64 base{u64{env.ReadCbufValue(desc.cbuf_index, desc.cbuf_offset)} |
+                               (u64{env.ReadCbufValue(desc.cbuf_index, desc.cbuf_offset + 4)} << 32)};
+                const std::optional<u32> value = env.ReadGlobalU32(base + offset);
+                missing |= !value;
+                return value.value_or(0);
+            });
+        if (!handle || missing) {
+            return std::nullopt;
+        }
+        return env.IsTexturePixelFormatInteger(*handle);
+    } catch (const std::exception&) {
+        // A disk cache environment without these words
+        return std::nullopt;
+    }
+}
+
+static bool IsImageAtomic(IR::Opcode opcode) {
+    switch (opcode) {
+    case IR::Opcode::ImageAtomicIAdd32:
+    case IR::Opcode::ImageAtomicSMin32:
+    case IR::Opcode::ImageAtomicUMin32:
+    case IR::Opcode::ImageAtomicSMax32:
+    case IR::Opcode::ImageAtomicUMax32:
+    case IR::Opcode::ImageAtomicInc32:
+    case IR::Opcode::ImageAtomicDec32:
+    case IR::Opcode::ImageAtomicAnd32:
+    case IR::Opcode::ImageAtomicOr32:
+    case IR::Opcode::ImageAtomicXor32:
+    case IR::Opcode::ImageAtomicExchange32:
+        return true;
+    default:
+        return false;
+    }
 }
 
 
@@ -1187,10 +1244,30 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
     u32 last_cbuf_index{};
     u32 last_cbuf_offset{};
     bool last_is_integer{false};
+    std::unordered_map<u32, std::optional<bool>> handle_program_integers;
     const auto is_texture_pixel_format_integer{[&](const ConstBufferAddr& cbuf_addr) {
         if (cbuf_addr.handle_program != ~0U) {
             // Every handle program is at cbuf 0 offset 0: the cache below can't tell them apart.
-            return IsTexturePixelFormatIntegerCached(env, cbuf_addr);
+            // Its descriptor is the one the handle selects now; without it, an atomic on the
+            // image still needs an integer image (EDEN_NX2_HANDLE_FORMATS=0: always float).
+            static const bool handle_formats = [] {
+                const char* text = std::getenv("EDEN_NX2_HANDLE_FORMATS");
+                return !text || std::string_view{text} != "0";
+            }();
+            if (!handle_formats) {
+                return false;
+            }
+            auto [it, inserted] = handle_program_integers.try_emplace(cbuf_addr.handle_program);
+            if (inserted) {
+                it->second = HandleProgramIsInteger(env, program.info, cbuf_addr.handle_program);
+                if (static const bool trace = std::getenv("EDEN_NX2_HANDLE_FORMAT_TRACE") != nullptr;
+                    trace) {
+                    LOG_INFO(Shader, "handle format: stage {} handle program {} of {}: {}",
+                             static_cast<int>(program.stage), cbuf_addr.handle_program, program.info.handle_programs.size(),
+                             it->second ? (*it->second ? "integer" : "float") : "unknown");
+                }
+            }
+            return it->second.value_or(false);
         }
         if (has_last_is_integer && last_cbuf_index == cbuf_addr.index &&
             last_cbuf_offset == cbuf_addr.offset) {
@@ -1283,7 +1360,9 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
             }
             const bool is_written{inst->GetOpcode() != IR::Opcode::ImageRead};
             const bool is_read{inst->GetOpcode() != IR::Opcode::ImageWrite};
-            const bool is_integer{is_texture_pixel_format_integer(cbuf)};
+            // Integer atomics need an integer image whatever the descriptor says.
+            const bool is_integer{is_texture_pixel_format_integer(cbuf) ||
+                                  (cbuf.handle_program != ~0U && IsImageAtomic(inst->GetOpcode()))};
             if (flags.type == TextureType::Buffer) {
                 index = descriptors.Add(ImageBufferDescriptor{
                     .format = flags.image_format,

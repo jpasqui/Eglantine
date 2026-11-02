@@ -79,6 +79,12 @@ public:
 
     [[nodiscard]] virtual u32 ReadCbufValue(u32 cbuf_index, u32 cbuf_offset) = 0;
 
+    /// A word of GPU memory (a handle table a shader reads through a storage buffer), when the
+    /// environment can provide it.
+    [[nodiscard]] virtual std::optional<u32> ReadGlobalU32(u64 gpu_addr) {
+        return std::nullopt;
+    }
+
     [[nodiscard]] virtual TextureType ReadTextureType(u32 raw_handle) = 0;
 
     [[nodiscard]] virtual TexturePixelFormat ReadTexturePixelFormat(u32 raw_handle) = 0;
