@@ -10,6 +10,7 @@
 
 #include <boost/algorithm/string/split.hpp>
 #include "common/fs/path_util.h"
+#include "common/game_presets.h"
 #include "common/settings.h"
 #include "common/settings_enums.h"
 #include "frontend_common/settings_generator.h"
@@ -1965,6 +1966,26 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
         QtCommon::system->ApplySettings();
     }
 
+    if (title_id == Settings::MarioKartWorldProgramId && !asked_recommended_mkw_settings) {
+        asked_recommended_mkw_settings = true;
+        use_recommended_mkw_settings =
+            QMessageBox::question(
+                this, tr("Recommended Mario Kart World settings"),
+                tr("Use the recommended settings for Mario Kart World?\n\n"
+                   "Vulkan, 1x resolution, GPU Fast, asynchronous shaders, BC3, conservative VRAM, "
+                   "reactive flushing off, FIFO Relaxed VSync, handheld mode, ScaleForce, and "
+                   "FXAA.\n\n"
+                   "They apply to Mario Kart World until Eglantine is closed. Your saved settings "
+                   "are not changed."),
+                QMessageBox::Yes | QMessageBox::No, QMessageBox::No) == QMessageBox::Yes;
+        LOG_INFO(Config, "MKW recommended settings accepted: {}", use_recommended_mkw_settings);
+    }
+    if (Settings::ApplyMarioKartWorldPreset(Settings::values, title_id,
+                                          use_recommended_mkw_settings)) {
+        QtCommon::system->ApplySettings();
+        Settings::UpdateGPUAccuracy();
+        LOG_INFO(Config, "Applied recommended MKW settings after per-game configuration");
+    }
     Settings::LogSettings();
 
     if (UISettings::values.select_user_on_boot && !user_flag_cmd_line) {
