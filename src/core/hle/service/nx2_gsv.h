@@ -2007,9 +2007,21 @@ private:
 
     // EDEN_NX2_FRAME_CAPTURE=<dir>: every 120th present, save what the renderer shows as
     // nx2-frame-<n>.tga in <dir> (lets hidden test runs check the output; idea from changes.patch).
+    // EDEN_NX2_FRAME_CAPTURE_EVERY=<n> changes the interval and EDEN_NX2_FRAME_CAPTURE_FROM=<present>
+    // starts capturing there, so a test can capture densely around the point it checks.
     void CaptureFrame() {
         static const char* const directory = std::getenv("EDEN_NX2_FRAME_CAPTURE");
-        if (directory == nullptr || (m_presents % 120) != 1 || m_capture_pending->exchange(true)) {
+        static const u64 every = [] {
+            const char* text = std::getenv("EDEN_NX2_FRAME_CAPTURE_EVERY");
+            const u64 value = text ? std::strtoull(text, nullptr, 10) : 0;
+            return value ? value : u64{120};
+        }();
+        static const u64 from = [] {
+            const char* text = std::getenv("EDEN_NX2_FRAME_CAPTURE_FROM");
+            return text ? std::strtoull(text, nullptr, 10) : u64{0};
+        }();
+        if (directory == nullptr || m_presents < from || (m_presents % every) != 1 % every ||
+            m_capture_pending->exchange(true)) {
             return;
         }
         const auto layout = Layout::DefaultFrameLayout(1280, 720);
@@ -2416,9 +2428,22 @@ private:
 
     void Log(HLERequestContext& ctx, std::string_view what) {
         const auto* w = ctx.CommandBuffer();
+        // EDEN_NX2_VDEC_TRACE: every command except the per-frame ones (submit, output info,
+        // release), which are sampled every 120th call, with the session's queue state.
+        static const bool trace = std::getenv("EDEN_NX2_VDEC_TRACE") != nullptr;
+        const u32 command = ctx.GetCommand();
+        const bool per_frame = command == 109 || command == 213 || command == 314;
         if (Nx2FirstVideoCommand(GetServiceName(), ctx.GetCommand())) {
             LOG_INFO(Service, "{} TIPC {} {} (first use): words {:08x}", GetServiceName(),
                      ctx.GetCommand(), what, fmt::join(std::span<const u32>{w, 12}, " "));
+        } else if (trace && (!per_frame || (++m_trace_counts[command] % 120) == 0)) {
+            std::scoped_lock lk{m_mutex};
+            LOG_INFO(Service,
+                     "{} TIPC {} {} #{}: words {:08x} | inputs {} decoded {} free {} outputs {} "
+                     "submitted {} out {}",
+                     GetServiceName(), command, what, m_trace_counts[command],
+                     fmt::join(std::span<const u32>{w + 2, 8}, " "), m_inputs.size(),
+                     m_decoded.size(), m_free.size(), m_outputs.size(), m_submitted, m_frames_out);
         } else {
             LOG_DEBUG(Service, "{} TIPC {} {}: [2]={:#x} [3]={:#x} [4]={:#x} [5]={:#x}",
                       GetServiceName(), ctx.GetCommand(), what, w[2], w[3], w[4], w[5]);
@@ -2551,6 +2576,31 @@ private:
         const u64 pts = u64{w[words]} | (u64{w[words + 1]} << 32);
         const bool end = (w[words + 2] & 0xFF) != 0;
         Log(ctx, "submit");
+        if (static const bool trace = std::getenv("EDEN_NX2_VDEC_TRACE") != nullptr; trace) {
+            // The last few submissions (raw words, cheap), shown when the decode thread goes idle.
+            std::array<u32, 11> raw{};
+            std::copy_n(w + 2, 10, raw.begin());
+            raw[10] = ctx.BufferDescriptorA().empty() ? ~0U
+                                                        : static_cast<u32>(ctx.GetReadBufferSize(0));
+            std::scoped_lock lk{m_mutex};
+            m_last_submits.push_back(raw);
+            if (m_last_submits.size() > 6) {
+                m_last_submits.pop_front();
+            }
+            m_restart_seen |= pts < m_last_submit_pts;
+            m_last_submit_pts = pts;
+        }
+        // EDEN_NX2_VDEC_SUBMIT_DELAY_US=<n>: hold each submission's reply n microseconds (an
+        // experiment: the title movie's loop survives only some runs, and slower submits seemed to help).
+        if (static const u32 delay = [] {
+                const char* value = std::getenv("EDEN_NX2_VDEC_SUBMIT_DELAY_US");
+                return value ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : 0U;
+            }();
+            delay != 0) {
+            const auto until = std::chrono::steady_clock::now() + std::chrono::microseconds{delay};
+            while (std::chrono::steady_clock::now() < until) {
+            }
+        }
         Input input{{}, pts, end};
         if (!ctx.BufferDescriptorA().empty()) {
             const auto data = ctx.ReadBufferA(0);
@@ -2612,10 +2662,35 @@ private:
         std::vector<u8> bytes;
         std::unique_lock lk{m_mutex};
         while (true) {
-            m_cv.wait(lk, [&] {
+            const auto has_work = [&] {
                 return m_quit || m_flush || (!m_decoded.empty() && !m_free.empty()) ||
                        (!m_inputs.empty() && m_decoded.size() < MaxDecodedAhead);
-            });
+            };
+            // EDEN_NX2_VDEC_TRACE: say what the decode thread waits for when idle for 2 s.
+            static const bool trace = std::getenv("EDEN_NX2_VDEC_TRACE") != nullptr;
+            if (trace) {
+                while (!m_cv.wait_for(lk, std::chrono::seconds{2}, has_work)) {
+                    LOG_INFO(Service,
+                             "{} idle: inputs {} decoded {} free {} outputs {} submitted {} out {} "
+                             "handed {} last pts {}",
+                             GetServiceName(), m_inputs.size(), m_decoded.size(), m_free.size(),
+                             m_outputs.size(), m_submitted, m_frames_out, m_handed,
+                             m_outputs.empty() ? 0 : m_outputs.back().pts);
+                    for (const auto& words : m_last_submits) {
+                        LOG_INFO(Service, "{} last submit: pts {} restart seen {} words {:08x}",
+                                 GetServiceName(), u64{words[3]} | (u64{words[4]} << 32),
+                                 m_restart_seen, fmt::join(words, " "));
+                    }
+                    for (const auto& output : m_last_outputs) {
+                        LOG_INFO(Service, "{} last output: image {} pts {} end {}", GetServiceName(),
+                                 output.image, output.pts, output.end);
+                    }
+                    m_last_outputs.clear();
+                    m_last_submits.clear();
+                }
+            } else {
+                m_cv.wait(lk, has_work);
+            }
             if (m_quit) {
                 return;
             }
@@ -2647,6 +2722,10 @@ private:
                 lk.lock();
                 // Even an image written during a flush counts: the client waits for its value.
                 m_outputs.push_back({image, width, height, frame.pts, frame.end});
+                m_last_outputs.push_back(m_outputs.back());
+                if (m_last_outputs.size() > 6) {
+                    m_last_outputs.pop_front();
+                }
                 system.Host1x().GetSyncpointManager().IncrementGuest(m_syncpoint);
                 ++m_frames_out;
                 if (m_frames_out == 1 || (m_frames_out % 600) == 0 || frame.end) {
@@ -2736,6 +2815,7 @@ private:
             // 16-GOB blocks, as our Eden tree writes these images.
             decoder->Render(*frame.picture, Tegra::Host1x::Nx2PictureFormat::Rgba8, width, height,
                             layout.pitch, 0, bytes);
+            DumpFrameRgba(bytes, layout.pitch, width, height);
             m_tiled.resize(layout.size);
             Tegra::Texture::SwizzleTexture(m_tiled, bytes, 4, static_cast<u32>(layout.pitch / 4),
                                            layout.height, 1, 4, 0, 1, true);
@@ -2780,6 +2860,27 @@ private:
         }
     }
 
+    // EDEN_NX2_VDEC_DUMP=<dir> for frames read on the GPU: every 120th decoded RGBA frame, a
+    // quarter of its size, as nx2-vdec-<frame>.ppm (colour, before the block-linear swizzle).
+    void DumpFrameRgba(const std::vector<u8>& bytes, u64 pitch, u32 width, u32 height) {
+        static const char* const directory = std::getenv("EDEN_NX2_VDEC_DUMP");
+        if (directory == nullptr || (m_frames_out % 120) != 0) {
+            return;
+        }
+        const u32 w = width / 4;
+        const u32 h = height / 4;
+        const std::string path = fmt::format("{}/nx2-vdec-{:05}.ppm", directory, m_frames_out + 1);
+        if (std::FILE* file = std::fopen(path.c_str(), "wb")) {
+            std::fprintf(file, "P6 %u %u 255\n", w, h);
+            for (u32 y = 0; y < h; ++y) {
+                for (u32 x = 0; x < w; ++x) {
+                    std::fwrite(&bytes[y * 4 * pitch + x * 16], 1, 3, file);
+                }
+            }
+            std::fclose(file);
+        }
+    }
+
     struct ReadyState {
         std::mutex mutex;
         Kernel::KEvent* event{};
@@ -2792,6 +2893,11 @@ private:
     std::shared_ptr<ReadyState> m_ready = std::make_shared<ReadyState>();
     std::shared_ptr<Core::Timing::EventType> m_ready_timer;
     u64 m_submitted{};
+    std::map<u32, u64> m_trace_counts; ///< EDEN_NX2_VDEC_TRACE sampling, per command
+    std::deque<std::array<u32, 11>> m_last_submits; ///< EDEN_NX2_VDEC_TRACE: the last submissions
+    std::deque<Output> m_last_outputs;               ///< EDEN_NX2_VDEC_TRACE: the last outputs
+    u64 m_last_submit_pts{};
+    bool m_restart_seen{};
     u32 m_syncpoint{NoSyncpoint}; ///< Counts finished frames (allocated at the first register)
     u32 m_sync_base{};            ///< Its value before the first frame
     std::vector<u8> m_tiled;      ///< Decode thread: block-linear copy of a frame (WriteImage)

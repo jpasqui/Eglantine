@@ -10,7 +10,10 @@
 #include <numeric>
 #include <cstdlib>
 #include <limits>
+#include <array>
 #include <map>
+#include <set>
+#include <tuple>
 #include <vector>
 #include <optional>
 #include <bit>
@@ -505,6 +508,28 @@ void TextureCache<P>::FillImageViews(std::span<ImageViewInOut> views, bool compu
             }
         }
     } while (has_deleted_images || (blacklist && has_blacklisted));
+    // EDEN_NX2_MOVIE_TRACE: the draws that sample a movie-sized image, and where they draw.
+    if (static const bool movie_trace = std::getenv("EDEN_NX2_MOVIE_TRACE") != nullptr;
+        movie_trace && !compute && maxwell3d != nullptr) {
+        for (const ImageViewInOut& view : views) {
+            if (view.id == NULL_IMAGE_VIEW_ID) continue;
+            const ImageViewBase& image_view = slot_image_views[view.id];
+            if (image_view.size.width < 3000) continue;
+            const auto& regs = maxwell3d->regs;
+            const u64 vs = (u64{regs.pipelines[1].reserved[0] & 0xff} << 32) | regs.pipelines[1].reserved[1];
+            const u64 ps = (u64{regs.pipelines[5].reserved[0] & 0xff} << 32) | regs.pipelines[5].reserved[1];
+            static std::set<std::tuple<u64, u64, GPUVAddr>> seen;
+            if (seen.size() < 32 && seen.insert({vs, ps, regs.rt[0].Address()}).second) {
+                LOG_INFO(HW_GPU,
+                         "movie draw vs={:#x} ps={:#x} samples view {}x{} format {} (index {:#x}) -> "
+                         "rt0 {:#x} {}x{} format {:#x} rt count {} blend {}",
+                         vs, ps, image_view.size.width, image_view.size.height,
+                         static_cast<u32>(image_view.format), view.index, regs.rt[0].Address(),
+                         regs.rt[0].width, regs.rt[0].height, static_cast<u32>(regs.rt[0].format),
+                         regs.rt_control.count.Value(), regs.blend.enable[0]);
+            }
+        }
+    }
 }
 
 template <class P>
@@ -1889,6 +1914,30 @@ ImageViewId TextureCache<P>::CreateImageView(const TICEntry& raw_config) {
     const SubresourceBase base = image.TryFindBase(config.Address()).value();
     ASSERT(base.level == 0);
     const ImageViewInfo view_info(config, base.layer);
+    // EDEN_NX2_MOVIE_TRACE: describe the views of movie-sized images (the 3648x2052 decoder
+    // images) as the game's descriptor names them and as the cache made them.
+    if (static const bool movie_trace = std::getenv("EDEN_NX2_MOVIE_TRACE") != nullptr;
+        movie_trace && config.Width() >= 3000) {
+        static std::vector<std::array<u64, 4>> logged;
+        if (logged.size() < 16 &&
+            std::find(logged.begin(), logged.end(), raw_config.raw) == logged.end()) {
+            logged.push_back(raw_config.raw);
+            LOG_INFO(HW_GPU,
+                     "movie view {:#x} {}x{} raw {:016x} {:016x} {:016x} {:016x}: format {:#x} "
+                     "types {}/{}/{}/{} swizzle {}{}{}{} srgb {} block {}/{} -> view format {} "
+                     "image format {} image {}x{} image addr {:#x}",
+                     config.Address(), config.Width(), config.Height(), raw_config.raw[0],
+                     raw_config.raw[1], raw_config.raw[2], raw_config.raw[3],
+                     static_cast<u32>(config.format.Value()), static_cast<u32>(config.r_type.Value()),
+                     static_cast<u32>(config.g_type.Value()), static_cast<u32>(config.b_type.Value()),
+                     static_cast<u32>(config.a_type.Value()), static_cast<u32>(config.x_source.Value()),
+                     static_cast<u32>(config.y_source.Value()), static_cast<u32>(config.z_source.Value()),
+                     static_cast<u32>(config.w_source.Value()), config.srgb_conversion.Value(),
+                     config.block_width.Value(), config.block_height.Value(),
+                     static_cast<u32>(info.format), static_cast<u32>(image.info.format),
+                     image.info.size.width, image.info.size.height, image.gpu_addr);
+        }
+    }
     const ImageViewId image_view_id = FindOrEmplaceImageView(image_id, view_info);
     ImageViewBase& image_view = slot_image_views[image_view_id];
     image_view.flags |= ImageViewFlagBits::Strong;
