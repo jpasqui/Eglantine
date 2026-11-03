@@ -11,6 +11,7 @@ on:
     branches:
       - nx2
       - nx2-experimental
+      - pikmin4-demo
     # A binary only changes when build inputs change; docs-only pushes skip the build.
     paths:
       - "src/**"
@@ -601,7 +602,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          # A fork's run numbers start again at 1, and the fork already has upstream's build-N tags.
           tag="build-${GITHUB_RUN_NUMBER}"
+          if [ "$GITHUB_REPOSITORY" != "Djihads80/Eglantine" ]; then tag="${GITHUB_REF_NAME}-build-${GITHUB_RUN_NUMBER}"; fi
           base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}"
 
           cat > notes.md <<EOF
@@ -641,12 +644,21 @@ jobs:
             --title "Eglantine ${GITHUB_REF_NAME} build ${GITHUB_RUN_NUMBER} (${GITHUB_SHA::7})" \
             --notes-file notes.md
 
+      # Skipped on forks without a DISCORD_WEBHOOK_URL secret; the role mention is upstream's server only.
       - name: Ping Discord
         shell: bash
         env:
           WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: |
+          if [ -z "$WEBHOOK" ]; then echo "No DISCORD_WEBHOOK_URL secret: not pinging"; exit 0; fi
           URL="https://github.com/${GITHUB_REPOSITORY}/releases/tag/build-${GITHUB_RUN_NUMBER}"
+          if [ "$GITHUB_REPOSITORY" != "Djihads80/Eglantine" ]; then
+            URL="https://github.com/${GITHUB_REPOSITORY}/releases/tag/${GITHUB_REF_NAME}-build-${GITHUB_RUN_NUMBER}"
+            jq -n --arg content "Eglantine ${GITHUB_REF_NAME} build ${GITHUB_RUN_NUMBER} (${GITHUB_SHA::7}): ${URL}" \
+              '{content: $content, allowed_mentions: {parse: []}}' \
+            | curl -fsS -H "Content-Type: application/json" -d @- "$WEBHOOK"
+            exit 0
+          fi
           MSG=$(printf '## <@&1566184315178713190> Eglantine %s build %s (%s)\n%s' \
             "$GITHUB_REF_NAME" "$GITHUB_RUN_NUMBER" "${GITHUB_SHA::7}" "$URL")
           jq -n --arg content "$MSG" \
