@@ -18,6 +18,7 @@
 #include "common/logging.h"
 #include "shader_recompiler/exception.h"
 #include "core/core.h"
+#include "video_core/nx2_vol_trace.h"
 #include "video_core/gpu_split.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/nx2.h"
@@ -39,8 +40,12 @@ KeplerCompute::KeplerCompute(MemoryManager& memory_manager_)
     , upload_state{memory_manager, regs.upload}
 {
     // EDEN_NX2_QMD_TRACE: log the QMD scheduler's loads, dependency counts and launches.
-    if (std::getenv("EDEN_NX2_QMD_TRACE")) {
-        native_qmd.trace = [this](std::string_view event, u64 address, s32 value) {
+    if (const char* qmd_trace = std::getenv("EDEN_NX2_QMD_TRACE")) {
+        const bool stale_only = std::string_view{qmd_trace} == "stale";
+        native_qmd.trace = [this, stale_only](std::string_view event, u64 address, s32 value) {
+            if (stale_only && !VideoCommon::Nx2VolTrace::StaleActive()) {
+                return;
+            }
             LOG_INFO(HW_GPU, "QMD trace {} {:#x} {} (engine {} as {})", event, address, value,
                      fmt::ptr(this), memory_manager.GetID());
         };
@@ -557,6 +562,12 @@ bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& 
     }
     if (!launch_description.block_dim_x || !launch_description.block_dim_y || !launch_description.block_dim_z)
         return false;
+    if (VideoCommon::Nx2VolTrace::StaleActive()) {
+        LOG_INFO(HW_GPU, "stale compute after draw #{} program {:#x} grid {}x{}x{} block {}x{}x{} cb0 {:#x}",
+                 VideoCommon::Nx2VolTrace::StaleDraw().load(), (u64{qmd[49] & 0x1ffff} << 32) | qmd[48],
+                 qmd[12], qmd[13] & 0xffff, qmd[14] & 0xffff, qmd[18] >> 16, qmd[19] & 0xffff, qmd[19] >> 16,
+                 (u64{qmd[33] & 0xff} << 32) | qmd[32]);
+    }
     try {
         rasterizer->DispatchCompute();
     } catch (const Shader::Exception& error) {

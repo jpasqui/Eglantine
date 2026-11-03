@@ -71,6 +71,10 @@ void State::ProcessData(const u32* data, size_t num_data) {
 
 void State::ProcessData(std::span<const u8> read_buffer) {
     const GPUVAddr address{regs.dest.Address()};
+    VideoCommon::Nx2VolTrace::NoteRange(address, (std::max<u64>)(read_buffer.size(), 1),
+                                        fmt::format("inline upload {} lines {} length {} depth {}",
+                                                    is_linear ? "linear" : "block", regs.line_count,
+                                                    regs.line_length_in, regs.dest.depth));
     if (VideoCommon::Nx2VolTrace::Enabled() &&
         VideoCommon::Nx2VolTrace::Overlaps(address, (std::max<u64>)(read_buffer.size(), 1)) &&
         VideoCommon::Nx2VolTrace::Budget()) {

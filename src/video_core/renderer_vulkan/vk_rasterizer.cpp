@@ -236,6 +236,24 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
       fence_manager(*this, gpu, texture_cache, buffer_cache, query_cache, device, scheduler),
       wfi_event(device.GetLogical().CreateEvent()) {
     scheduler.SetQueryCache(query_cache);
+    if (VideoCommon::Nx2VolTrace::RangeHistory() || VideoCommon::Nx2VolTrace::UploadSync()) {
+        VideoCommon::Nx2VolTrace::BufferGpuModifiedHook() = [this](u64 addr, u64 size) {
+            return buffer_cache.IsRegionGpuModified(addr, static_cast<size_t>(size));
+        };
+        VideoCommon::Nx2VolTrace::BufferDownloadHook() = [this](u64 addr, u64 size) {
+            // As FlushRegion: bytes a collected guest CPU write covers keep the CPU's value.
+            VideoCommon::Nx2PendingWrites::Ranges pending;
+            if (VideoCommon::Nx2PendingWrites::Enabled()) {
+                gpu.ForEachPendingCpuWrite([&](PAddr pending_addr, size_t pending_size) {
+                    if (pending_addr < addr + size && addr < pending_addr + pending_size) {
+                        pending.emplace_back(pending_addr, pending_size);
+                    }
+                });
+            }
+            const VideoCommon::Nx2PendingWrites::Scope pending_scope{pending.empty() ? nullptr : &pending};
+            buffer_cache.DownloadMemory(addr, size);
+        };
+    }
 }
 
 RasterizerVulkan::~RasterizerVulkan() {
@@ -481,6 +499,39 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
                      is_indexed ? maxwell3d->draw_manager.draw_state.index_buffer.count
                                 : maxwell3d->draw_manager.draw_state.vertex_buffer.count,
                      instance_count, 0);
+        const auto& regs = maxwell3d->regs;
+        static std::set<u64> scanned;
+        for (const u32 stage_index : {0u, 4u}) {
+            const auto& stage = maxwell3d->state.shader_stages[stage_index];
+            for (u32 slot = 0; slot < Tegra::Engines::Maxwell3D::Regs::MaxConstBuffers; ++slot) {
+                const auto& buffer = stage.const_buffers[slot];
+                if (!buffer.enabled || buffer.size < 8 || !scanned.insert(buffer.address).second) continue;
+                std::vector<float> values((std::min<u32>)(buffer.size, 0x10000) / 4);
+                gpu_memory->ReadBlockUnsafe(buffer.address, values.data(), values.size() * 4);
+                for (size_t i = 0; i + 1 < values.size(); ++i) {
+                    const float a = values[i], b = values[i + 1];
+                    if (!(a > 1e-6f && a < 1e6f) || std::fabs(a - 1.0f) < 1e-6f) continue;
+                    if (std::fabs(a * b - 1.0f) < 1e-4f) {
+                        LOG_INFO(HW_GPU, "stale draw #{} stage {} cbuf {} at {:#x} +{:#x}: reciprocal pair {} {}",
+                                 VideoCommon::Nx2VolTrace::StaleDraw().load(), stage_index, slot, buffer.address,
+                                 i * 4, a, b);
+                    }
+                }
+            }
+        }
+        if (regs.rt[0].width == 4 && regs.rt[0].height == 1 && static_cast<u32>(regs.rt[0].format) == 0xc0) {
+            const auto& stage = maxwell3d->state.shader_stages[4];
+            for (u32 slot = 0; slot < Tegra::Engines::Maxwell3D::Regs::MaxConstBuffers; ++slot) {
+                const auto& buffer = stage.const_buffers[slot];
+                if (!buffer.enabled || buffer.size == 0) continue;
+                std::array<u32, 64> words{};
+                const u32 size = (std::min<u32>)(buffer.size, static_cast<u32>(sizeof(words)));
+                gpu_memory->ReadBlockUnsafe(buffer.address, words.data(), size);
+                LOG_INFO(HW_GPU, "stale draw #{} fs cbuf {} at {:#x} size {:#x}: {:08x}",
+                         VideoCommon::Nx2VolTrace::StaleDraw().load(), slot, buffer.address, buffer.size,
+                         fmt::join(words, " "));
+            }
+        }
     }
     TraceWindowTarget(*maxwell3d, *gpu_memory, is_indexed ? "draw-indexed" : "draw",
                       is_indexed ? maxwell3d->draw_manager.draw_state.index_buffer.count

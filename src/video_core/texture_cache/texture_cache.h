@@ -286,6 +286,7 @@ void TextureCache<P>::ApplyThresholdOverrides(bool log) {
 
 template <class P>
 void TextureCache<P>::TickFrame() {
+    Nx2VolTrace::RangeFrame().store(frame_tick, std::memory_order_relaxed);
     // EDEN_NX2_VOL_DUMP=<frame>,<dir>: at that frame, write the host contents (linear, as the
     // cache holds them) of every 3D image of at least 16x16x16 to <dir>, without touching guest
     // memory, to compare lightmap volumes between runs.
@@ -361,6 +362,33 @@ void TextureCache<P>::TickFrame() {
                              image_id.index, gpu_addr,
                              Common::CityHash64(reinterpret_cast<const char*>(host.data()), host.size()),
                              Nx2VolTrace::CountNonzeroWords(host), host.size() / 8);
+                    if (Nx2VolTrace::StaleValues()) {
+                        using VideoCore::Surface::PixelFormat;
+                        u32 kind = 0, bpt = 0;
+                        switch (image.info.format) {
+                        case PixelFormat::R16G16B16A16_FLOAT: kind = 1; bpt = 8; break;
+                        case PixelFormat::B10G11R11_FLOAT: kind = 2; bpt = 4; break;
+                        case PixelFormat::R32G32B32A32_FLOAT: kind = 3; bpt = 16; break;
+                        case PixelFormat::R32_FLOAT: kind = 4; bpt = 4; break;
+                        case PixelFormat::R16_FLOAT: kind = 5; bpt = 2; break;
+                        case PixelFormat::R32G32_FLOAT: kind = 6; bpt = 8; break;
+                        case PixelFormat::R16G16_FLOAT: kind = 7; bpt = 4; break;
+                        case PixelFormat::A8B8G8R8_UNORM:
+                        case PixelFormat::A8B8G8R8_SRGB:
+                        case PixelFormat::B8G8R8A8_UNORM:
+                        case PixelFormat::B8G8R8A8_SRGB: kind = 8; bpt = 4; break;
+                        case PixelFormat::A2B10G10R10_UNORM: kind = 9; bpt = 4; break;
+                        default: break;
+                        }
+                        if (kind != 0) {
+                            const u64 texels = u64{image.info.size.width} * image.info.size.height *
+                                               image.info.size.depth;
+                            LOG_INFO(HW_GPU, "stale values id {} gpu {:#x} {}x{}x{} format {}:{}", image_id.index,
+                                     gpu_addr, image.info.size.width, image.info.size.height,
+                                     image.info.size.depth, static_cast<u32>(image.info.format),
+                                     Nx2VolTrace::ValueStats(kind, bpt, host, texels));
+                        }
+                    }
                 });
             }
             LOG_INFO(HW_GPU, "stale trace ends: {} draws, {} images, {} hashed", Nx2VolTrace::StaleDraw().load(),
@@ -966,6 +994,21 @@ void TextureCache<P>::UpdateRenderTargets(bool is_clear) {
 
     if (render_targets != previous_render_targets) {
         ++render_targets_serial;
+        if (Nx2VolTrace::StaleActive()) {
+            std::string list;
+            for (size_t index = 0; index < NUM_RT; ++index) {
+                const ImageViewId view = render_targets.color_buffer_ids[index];
+                if (!view) continue;
+                const ImageId id = slot_image_views[view].image_id;
+                const Image& image = slot_images[id];
+                list += fmt::format(" {}:{}@{:#x} {}x{} f{} view f{}", index, id.index, image.gpu_addr,
+                                    image.info.size.width, image.info.size.height,
+                                    static_cast<u32>(image.info.format),
+                                    static_cast<u32>(slot_image_views[view].format));
+                Nx2VolTrace::StaleSampled().emplace_back(id.index, image.gpu_addr);
+            }
+            LOG_INFO(HW_GPU, "stale targets after draw #{}:{}", Nx2VolTrace::StaleDraw().load(), list);
+        }
     }
 
     flags[Dirty::DepthBiasGlobal] = true;
@@ -1725,6 +1768,25 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
                                    frame_tick};
     }
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::TextureUpload};
+
+    if ((Nx2VolTrace::RangeHistory() || Nx2VolTrace::UploadSync()) && Nx2VolTrace::BufferGpuModifiedHook() &&
+        Nx2VolTrace::BufferGpuModifiedHook()(image.cpu_addr, image.guest_size_bytes)) {
+        if (Nx2VolTrace::RangeHistory()) {
+            static std::set<std::pair<u64, u32>> logged;
+            if (logged.insert({image.gpu_addr, static_cast<u32>(image.info.format)}).second) {
+                LOG_INFO(HW_GPU,
+                         "upload over GPU-written buffer data: image id {} gpu {:#x} device {:#x} size {:#x} type {} "
+                         "{}x{}x{} format {} frame {}{}",
+                         image_id.index, image.gpu_addr, image.cpu_addr, image.guest_size_bytes,
+                         static_cast<u32>(image.info.type), image.info.size.width, image.info.size.height,
+                         image.info.size.depth, static_cast<u32>(image.info.format), frame_tick,
+                         Nx2VolTrace::UploadSync() ? " (synced)" : "");
+            }
+        }
+        if (Nx2VolTrace::UploadSync() && Nx2VolTrace::BufferDownloadHook()) {
+            Nx2VolTrace::BufferDownloadHook()(image.cpu_addr, image.guest_size_bytes);
+        }
+    }
 
     image.flags &= ~ImageFlagBits::CpuModified;
 
@@ -2652,6 +2714,36 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
     }
     const ImageId new_image_id = slot_images.insert(runtime, new_info, gpu_addr, cpu_addr);
     Image& new_image = slot_images[new_image_id];
+    if (Nx2VolTrace::RangeHistory()) {
+        const std::string what = fmt::format(
+            "image create id {} type {} {}x{}x{} layers {} levels {} format {} joins {} bad {} ignore {}",
+            new_image_id.index, static_cast<u32>(new_info.type), new_info.size.width, new_info.size.height,
+            new_info.size.depth, new_info.resources.layers, new_info.resources.levels,
+            static_cast<u32>(new_info.format), join_copies_to_do.size(), join_bad_overlap_ids.size(),
+            join_ignore_textures.size());
+        if (new_info.type == ImageType::e3D && new_info.size.width >= 16 && new_info.size.height >= 16 &&
+            new_info.size.depth >= 16) {
+            std::vector<u8> guest(new_image.guest_size_bytes);
+            gpu_memory->ReadBlockUnsafe(gpu_addr, guest.data(), guest.size());
+            LOG_INFO(HW_GPU, "range history of {:#x}+{:#x} ({}, guest nonzero words {} of {}) at frame {}:",
+                     gpu_addr, new_image.guest_size_bytes, what, Nx2VolTrace::CountNonzeroWords(guest),
+                     guest.size() / 8, frame_tick);
+            bool written = false;
+            for (const auto& event : Nx2VolTrace::RangeEventsOverlapping(gpu_addr, new_image.guest_size_bytes)) {
+                LOG_INFO(HW_GPU, "  frame {} {:#x}+{:#x}: {}", event.frame, event.gpu_addr, event.size,
+                         event.what);
+                written |= event.gpu_addr == gpu_addr && event.what.starts_with("dma ") &&
+                           event.what.find("->block") != std::string::npos;
+            }
+            static const bool zero_probe = std::getenv("EDEN_NX2_ZERO_UNWRITTEN_3D") != nullptr;
+            if (zero_probe && !written && new_info.format == PixelFormat::A8B8G8R8_UINT) {
+                const std::vector<u8> zeros(new_image.guest_size_bytes);
+                gpu_memory->WriteBlockUnsafe(gpu_addr, zeros.data(), zeros.size());
+                LOG_INFO(HW_GPU, "  zero probe: guest memory of {:#x} zeroed before its first upload", gpu_addr);
+            }
+        }
+        Nx2VolTrace::NoteRange(gpu_addr, new_image.guest_size_bytes, what);
+    }
     if (Nx2VolTrace::Enabled()) {
         const bool is_3d = new_info.type == ImageType::e3D;
         if (is_3d) {
@@ -3375,6 +3467,13 @@ void TextureCache<P>::UntrackImage(ImageBase& image, ImageId image_id) {
 
 template <class P>
 void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
+    if (Nx2VolTrace::RangeHistory()) {
+        const ImageBase& deleted = slot_images[image_id];
+        Nx2VolTrace::NoteRange(deleted.gpu_addr, deleted.guest_size_bytes,
+                               fmt::format("image delete id {} format {} flags {:#x}", image_id.index,
+                                           static_cast<u32>(deleted.info.format),
+                                           static_cast<u32>(deleted.flags)));
+    }
     ImageBase& image = slot_images[image_id];
     ++images_deleted;
     if (Nx2VolTrace::Traced(image)) {
@@ -3538,6 +3637,13 @@ void TextureCache<P>::RemoveFramebuffers(std::span<const ImageViewId> removed_vi
 
 template <class P>
 void TextureCache<P>::MarkModification(ImageBase& image) noexcept {
+    if (Nx2VolTrace::RangeHistory() && False(image.flags & ImageFlagBits::GpuModified)) {
+        Nx2VolTrace::NoteRange(image.gpu_addr, image.guest_size_bytes,
+                               fmt::format("image gpu write (first since clean) format {} {}x{}x{} type {}",
+                                           static_cast<u32>(image.info.format), image.info.size.width,
+                                           image.info.size.height, image.info.size.depth,
+                                           static_cast<u32>(image.info.type)));
+    }
     if (False(image.flags & ImageFlagBits::GpuModified) && Nx2VolTrace::Traced(image)) {
         LOG_INFO(HW_GPU, "vol gpu write {:#x} flags {:#x} frame {}", image.gpu_addr,
                  static_cast<u32>(image.flags), frame_tick);

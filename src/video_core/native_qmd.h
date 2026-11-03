@@ -52,6 +52,7 @@ public:
                     state.dependencies = std::int32_t((qmd[4] >> 14) & 0xffff) + state.deferred;
                     if (trace) trace("base", request.address, std::int32_t((qmd[4] >> 14) & 0xffff));
                     if (trace) trace("load", request.address, state.dependencies);
+                    if (trace) trace("program-low", request.address, std::int32_t(qmd[48]));
                     state.deferred = 0;
                     state.loaded = true;
                     state.completed = false;

@@ -122,6 +122,46 @@ void MaxwellDMA::Launch() {
         }
     }
 
+    if (VideoCommon::Nx2VolTrace::StaleActive()) {
+        LOG_INFO(HW_GPU,
+                 "stale dma after draw #{}: {:#x} -> {:#x} src {} dst {} multi {} remap {} lines {} length {} "
+                 "pitch {}/{} src {}x{}x{} origin {},{} dst {}x{}x{} origin {},{}",
+                 VideoCommon::Nx2VolTrace::StaleDraw().load(), static_cast<u64>(regs.offset_in),
+                 static_cast<u64>(regs.offset_out),
+                 regs.launch_dma.src_memory_layout.Value() == LaunchDMA::MemoryLayout::PITCH ? "pitch" : "block",
+                 regs.launch_dma.dst_memory_layout.Value() == LaunchDMA::MemoryLayout::PITCH ? "pitch" : "block",
+                 regs.launch_dma.multi_line_enable.Value(), regs.launch_dma.remap_enable.Value(), regs.line_count,
+                 regs.line_length_in, regs.pitch_in, regs.pitch_out, regs.src_params.width, regs.src_params.height,
+                 regs.src_params.depth, regs.src_params.origin.x.Value(), regs.src_params.origin.y.Value(),
+                 regs.dst_params.width, regs.dst_params.height, regs.dst_params.depth,
+                 regs.dst_params.origin.x.Value(), regs.dst_params.origin.y.Value());
+    }
+    if (VideoCommon::Nx2VolTrace::RangeHistory()) {
+        const bool dst_block = regs.launch_dma.dst_memory_layout.Value() != LaunchDMA::MemoryLayout::PITCH;
+        const u64 lines = regs.launch_dma.multi_line_enable ? (std::max)(regs.line_count, 1U) : 1U;
+        const u64 dst_size = dst_block ? u64{regs.dst_params.width} * regs.dst_params.height *
+                                             (std::max)(regs.dst_params.depth, 1U)
+                                       : u64{static_cast<u32>(std::abs(regs.pitch_out))} * (lines - 1) +
+                                             u64{regs.line_length_in} *
+                                                 (regs.launch_dma.remap_enable
+                                                      ? (regs.remap_const.component_size_minus_one + 1) *
+                                                            (regs.remap_const.num_dst_components_minus_one + 1)
+                                                      : 1);
+        VideoCommon::Nx2VolTrace::NoteRange(
+            regs.offset_out, (std::max)(dst_size, u64{1}),
+            fmt::format("dma from {:#x} {} multi {} remap {} const {:#x} dst_x {} comp {}x{} lines {} length {} "
+                        "pitch {}/{} dst {}x{}x{}",
+                        static_cast<u64>(regs.offset_in),
+                        regs.launch_dma.src_memory_layout.Value() != LaunchDMA::MemoryLayout::PITCH
+                            ? (dst_block ? "block->block" : "block->pitch")
+                            : (dst_block ? "pitch->block" : "pitch->pitch"),
+                        regs.launch_dma.multi_line_enable.Value(), regs.launch_dma.remap_enable.Value(),
+                        regs.remap_const.remap_consta_value, static_cast<u32>(regs.remap_const.dst_x.Value()),
+                        regs.remap_const.num_dst_components_minus_one + 1,
+                        regs.remap_const.component_size_minus_one + 1, regs.line_count, regs.line_length_in,
+                        regs.pitch_in, regs.pitch_out, regs.dst_params.width, regs.dst_params.height,
+                        regs.dst_params.depth));
+    }
     // TODO(Subv): Perform more research and implement all features of this engine.
     const LaunchDMA& launch = regs.launch_dma;
     ASSERT(launch.interrupt_type == LaunchDMA::InterruptType::NONE);
