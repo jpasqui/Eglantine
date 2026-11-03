@@ -216,6 +216,43 @@ inline bool Nx2InSemaphoreFirstPage(u64 address) {
     return false;
 }
 
+/// First-page words (device addresses) that got a direct, not mirrored, release (EDEN_NX2_SEM_MIRROR_SHADOW).
+inline std::vector<u64>& Nx2DirectSemaphoreWords() {
+    static std::vector<u64> words;
+    return words;
+}
+
+inline std::atomic<bool>& Nx2DirectSemaphoreWordsUsed() {
+    static std::atomic<bool> used{};
+    return used;
+}
+
+/// A direct release landed at `gpu_address` (device `device_address`): if that is a first-page word, mirrored
+/// releases to it stay in the shadow table from now on, and its shadow value is gone (the release is newer).
+inline void Nx2NoteDirectRelease(u64 device_address, u64 gpu_address) {
+    if (!Nx2InSemaphoreFirstPage(gpu_address)) {
+        return;
+    }
+    const u64 word = device_address & ~u64{3};
+    std::scoped_lock lock{Nx2MirrorShadowMutex()};
+    auto& words = Nx2DirectSemaphoreWords();
+    if (std::find(words.begin(), words.end(), word) == words.end() && words.size() < 1024) {
+        words.push_back(word);
+        Nx2DirectSemaphoreWordsUsed().store(true, std::memory_order_release);
+    }
+    Nx2MirrorShadowWords().erase(word);
+}
+
+/// Whether a mirrored release to this word goes to the shadow table instead of guest memory.
+inline bool Nx2MirrorToShadow(u64 device_address) {
+    if (!Nx2MirrorShadowOn() || !Nx2DirectSemaphoreWordsUsed().load(std::memory_order_acquire)) {
+        return false;
+    }
+    std::scoped_lock lock{Nx2MirrorShadowMutex()};
+    const auto& words = Nx2DirectSemaphoreWords();
+    return std::find(words.begin(), words.end(), device_address & ~u64{3}) != words.end();
+}
+
 /// The region's memory was destroyed: stop mirroring into it.
 inline void Nx2RemoveSemaphoreRegion(u64 start) {
     for (auto& region : g_nx2_semaphore_regions) {
