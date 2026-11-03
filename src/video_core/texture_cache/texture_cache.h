@@ -23,6 +23,7 @@
 #include <boost/container/small_vector.hpp>
 
 #include "common/alignment.h"
+#include "common/cityhash.h"
 #include "common/settings.h"
 #include "common/slot_vector.h"
 #include "video_core/control/channel_state.h"
@@ -299,6 +300,7 @@ void TextureCache<P>::TickFrame() {
             return result;
         }();
         dump.first != 0 && frame_tick == dump.first && gpu_memory != nullptr) {
+        // (EDEN_NX2_STALE_TRACE is handled below.)
         std::vector<std::pair<u64, u64>> ranges;
         {
             std::scoped_lock lock{Nx2VolTrace::RangeMutex()};
@@ -329,6 +331,40 @@ void TextureCache<P>::TickFrame() {
                 }
                 LOG_INFO(HW_GPU, "vol dump {:#x} id {} -> {}", image.gpu_addr, image_id.index, path);
             });
+        }
+    }
+    if (const u64 stale_frame = Nx2VolTrace::StaleFrame(); stale_frame != 0 && gpu_memory != nullptr) {
+        static bool started = false;
+        const u64 presents = Nx2VolTrace::PresentCount().load(std::memory_order_relaxed);
+        if (!started && presents >= stale_frame) {
+            started = true;
+            LOG_INFO(HW_GPU, "stale trace begins at present {} frame {}", presents, frame_tick);
+            Nx2VolTrace::StaleActive() = true;
+        } else if (started && presents >= stale_frame + 1 && Nx2VolTrace::StaleActive()) {
+            Nx2VolTrace::StaleActive() = false;
+            u32 hashed = 0;
+            for (const auto& [index, gpu_addr] : Nx2VolTrace::StaleSampled()) {
+                const auto cpu = gpu_memory->GpuToCpuAddress(gpu_addr);
+                if (!cpu || hashed >= 3000) continue;
+                ForEachImageInRegion(*cpu, 1, [&](ImageId image_id, Image& image) {
+                    if (image_id.index != index || image.gpu_addr != gpu_addr ||
+                        True(image.flags & (ImageFlagBits::Unbacked | ImageFlagBits::Sparse))) {
+                        return;
+                    }
+                    ++hashed;
+                    auto map = runtime.DownloadStagingBuffer(image.unswizzled_size_bytes);
+                    const auto copies = FullDownloadCopies(image.info);
+                    image.DownloadMemory(map, copies);
+                    runtime.Finish();
+                    const std::span<const u8> host{map.mapped_span.data(), image.unswizzled_size_bytes};
+                    LOG_INFO(HW_GPU, "stale host id {} gpu {:#x} hash {:016x} nonzero words {} of {}",
+                             image_id.index, gpu_addr,
+                             Common::CityHash64(reinterpret_cast<const char*>(host.data()), host.size()),
+                             Nx2VolTrace::CountNonzeroWords(host), host.size() / 8);
+                });
+            }
+            LOG_INFO(HW_GPU, "stale trace ends: {} draws, {} images, {} hashed", Nx2VolTrace::StaleDraw().load(),
+                     Nx2VolTrace::StaleSampled().size(), hashed);
         }
     }
     // Upload buffers grown for one huge image (title 1's 341 MiB terrain layer pools) are freed
@@ -565,6 +601,64 @@ void TextureCache<P>::FillImageViews(std::span<ImageViewInOut> views, bool compu
             }
         }
     } while (has_deleted_images || (blacklist && has_blacklisted));
+    if (Nx2VolTrace::StaleActive() && gpu_memory != nullptr) {
+        static std::set<u32> seen;
+        static u64 seen_frame = ~u64{0};
+        if (seen_frame != frame_tick) {
+            seen.clear();
+            seen_frame = frame_tick;
+        }
+        std::string list;
+        for (const ImageViewInOut& view : views) {
+            if (view.id == NULL_IMAGE_VIEW_ID) {
+                list += fmt::format(" {:x}:-", view.index);
+                continue;
+            }
+            const ImageViewBase& image_view = slot_image_views[view.id];
+            if (!image_view.image_id) {
+                list += fmt::format(" {:x}:buf{:#x}", view.index, image_view.gpu_addr);
+                continue;
+            }
+            const ImageId image_id = image_view.image_id;
+            Image& image = slot_images[image_id];
+            char mark = '.';
+            const auto& uploads = Nx2VolTrace::Uploads();
+            const bool recorded = image_id.index < uploads.size() && uploads[image_id.index].gpu_addr == image.gpu_addr;
+            std::vector<u8> guest;
+            const bool first = seen.insert(image_id.index).second;
+            u64 hash = 0, nonzero = 0;
+            if (first) {
+                guest.resize(std::min<size_t>(image.guest_size_bytes, 64_MiB));
+                gpu_memory->ReadBlockUnsafe(image.gpu_addr, guest.data(), guest.size());
+                hash = Common::CityHash64(reinterpret_cast<const char*>(guest.data()), guest.size());
+                nonzero = Nx2VolTrace::CountNonzeroWords(guest);
+                Nx2VolTrace::StaleSampled().emplace_back(image_id.index, image.gpu_addr);
+            }
+            if (True(image.flags & ImageFlagBits::GpuModified)) {
+                mark = 'G';
+            } else if (!recorded) {
+                mark = 'N';
+            } else if (first && uploads[image_id.index].hash != hash) {
+                mark = 'S';
+            }
+            if (first) {
+                if (nonzero == 0 && mark == '.') mark = 'Z';
+                LOG_INFO(HW_GPU,
+                         "stale image id {} gpu {:#x} {}x{}x{} levels {} format {} type {} flags {:#x} guest {:016x} "
+                         "nonzero words {} of {} upload {:016x} frame {} mark {}",
+                         image_id.index, image.gpu_addr, image.info.size.width, image.info.size.height,
+                         image.info.size.depth, image.info.resources.levels, static_cast<u32>(image.info.format),
+                         static_cast<u32>(image.info.type), static_cast<u32>(image.flags), hash, nonzero,
+                         guest.size() / 8, recorded ? uploads[image_id.index].hash : 0,
+                         recorded ? uploads[image_id.index].frame : 0, mark);
+            }
+            list += fmt::format(" {:x}:{}{}{}", view.index, image_id.index, mark,
+                                image_view.format != image.info.format
+                                    ? fmt::format("/v{}", static_cast<u32>(image_view.format))
+                                    : std::string{});
+        }
+        LOG_INFO(HW_GPU, "stale {} #{}:{}", compute ? "dispatch" : "views", Nx2VolTrace::StaleDraw().load(), list);
+    }
     // EDEN_NX2_MOVIE_TRACE: the draws that sample a movie-sized image, and where they draw.
     if (static const bool movie_trace = std::getenv("EDEN_NX2_MOVIE_TRACE") != nullptr;
         movie_trace && !compute && maxwell3d != nullptr) {
@@ -1617,6 +1711,18 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
         LOG_INFO(HW_GPU, "vol upload {:#x} id {} flags {:#x} guest hash {:016x} nonzero {} of {} frame {}",
                  image.gpu_addr, image_id.index, static_cast<u32>(image.flags), digest.hash,
                  digest.nonzero, guest.size(), frame_tick);
+    }
+    if (Nx2VolTrace::StaleFrame() != 0 && gpu_memory != nullptr) {
+        std::vector<u8> guest(std::min<size_t>(image.guest_size_bytes, 64_MiB));
+        gpu_memory->ReadBlockUnsafe(image.gpu_addr, guest.data(), guest.size());
+        auto& uploads = Nx2VolTrace::Uploads();
+        if (uploads.size() <= image_id.index) {
+            uploads.resize(image_id.index + 1);
+        }
+        uploads[image_id.index] = {image.gpu_addr,
+                                   Common::CityHash64(reinterpret_cast<const char*>(guest.data()),
+                                                      guest.size()),
+                                   frame_tick};
     }
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::TextureUpload};
 

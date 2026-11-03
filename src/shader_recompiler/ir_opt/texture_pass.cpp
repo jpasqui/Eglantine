@@ -412,16 +412,16 @@ static std::optional<bool> HandleProgramIsInteger(Environment& env, const Info& 
     return std::nullopt;
 }
 
-/// The type of the descriptor a handle program selects. On with EDEN_NX2_SURFACE_OPS (the
-/// programs that need it only run then) or EDEN_NX2_HANDLE_TYPES=1; EDEN_NX2_HANDLE_TYPES=0: off.
-/// Runs with it lost the device 2 times in 6 (cause not found), so it is not on by default.
+/// The type of the descriptor a handle program selects. On unless EDEN_NX2_SURFACE_OPS=0 (the
+/// programs that need it only run with surface ops); EDEN_NX2_HANDLE_TYPES=1/0 overrides.
 static std::optional<TextureType> HandleProgramTextureType(Environment& env, const Info& info,
                                                            u32 program) {
     static const bool handle_types = [] {
         if (const char* text = std::getenv("EDEN_NX2_HANDLE_TYPES")) {
             return std::string_view{text} != "0";
         }
-        return std::getenv("EDEN_NX2_SURFACE_OPS") != nullptr;
+        const char* surface_ops = std::getenv("EDEN_NX2_SURFACE_OPS");
+        return surface_ops == nullptr || surface_ops[0] != '0';
     }();
     if (!handle_types) {
         return std::nullopt;

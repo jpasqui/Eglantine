@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <span>
 #include <utility>
@@ -143,6 +144,62 @@ struct Digest {
     u64 hash;
     u64 nonzero;
 };
+
+// EDEN_NX2_STALE_TRACE=<present>: from that present to the next, every draw (programs, targets, counts,
+// depth state) and the images it samples. Each image is logged once with its flags and the hash of
+// its guest data now and at its last upload; at the next frame each sampled image's host contents
+// are downloaded and hashed, to compare a good and a bad run image by image.
+inline u64 StaleFrame() {
+    static const u64 frame = [] {
+        const char* value = std::getenv("EDEN_NX2_STALE_TRACE");
+        return value ? std::strtoull(value, nullptr, 10) : u64{0};
+    }();
+    return frame;
+}
+
+/// Presents so far (set by nx2:vi2), so the trace starts at a present number.
+inline std::atomic<u64>& PresentCount() {
+    static std::atomic<u64> presents{};
+    return presents;
+}
+
+inline std::atomic<bool>& StaleActive() {
+    static std::atomic<bool> active{};
+    return active;
+}
+
+inline std::atomic<u32>& StaleDraw() {
+    static std::atomic<u32> draw{};
+    return draw;
+}
+
+struct UploadRecord {
+    u64 gpu_addr;
+    u64 hash;
+    u64 frame;
+};
+
+/// Last upload of each image (by slot index) while the stale trace is enabled.
+inline std::vector<UploadRecord>& Uploads() {
+    static std::vector<UploadRecord> uploads;
+    return uploads;
+}
+
+/// Images sampled in the traced frame (slot index, GPU address), in first-use order.
+inline std::vector<std::pair<u32, u64>>& StaleSampled() {
+    static std::vector<std::pair<u32, u64>> sampled;
+    return sampled;
+}
+
+inline u64 CountNonzeroWords(std::span<const u8> data) {
+    u64 count = 0;
+    for (size_t i = 0; i + 8 <= data.size(); i += 8) {
+        u64 word;
+        std::memcpy(&word, data.data() + i, 8);
+        count += word != 0 ? 1 : 0;
+    }
+    return count;
+}
 
 inline Digest Hash(std::span<const u8> data) {
     u64 hash = 0xcbf29ce484222325ULL;

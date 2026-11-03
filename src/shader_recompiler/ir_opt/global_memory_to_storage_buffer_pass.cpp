@@ -514,8 +514,8 @@ void CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info) 
     std::optional<StorageBufferAddr> storage_buffer{cached_track(&nvn_bias, info.biased_tracks)};
     if (!storage_buffer) {
         // If it fails, track without a bias. When the word found is not the low half of the
-        // address's 64-bit base, take the word that is. On with EDEN_NX2_SURFACE_OPS or
-        // EDEN_NX2_POINTER_PAIRS (=0 turns it off): with the right base but without the surface
+        // address's 64-bit base, take the word that is. On unless EDEN_NX2_SURFACE_OPS=0;
+        // EDEN_NX2_POINTER_PAIRS=1/0 overrides: with the right base but without the surface
         // ops, the Pikmin 4 demo's per-frame passes read lightmap volumes nothing wrote (glow).
         storage_buffer = cached_track(nullptr, info.unbiased_tracks);
         static const bool pointer_pairs = [] {
@@ -523,7 +523,7 @@ void CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info) 
                 const char* text = std::getenv(name);
                 return text ? std::optional<bool>{std::string_view{text} != "0"} : std::nullopt;
             };
-            return set("EDEN_NX2_POINTER_PAIRS").value_or(set("EDEN_NX2_SURFACE_OPS").value_or(false));
+            return set("EDEN_NX2_POINTER_PAIRS").value_or(set("EDEN_NX2_SURFACE_OPS").value_or(true));
         }();
         if (pointer_pairs) {
             if (const auto pair = TrackPointerPair(inst, storage_buffer)) {

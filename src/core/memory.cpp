@@ -658,10 +658,20 @@ struct Memory::Impl {
 
             page_table.entries.ZeroRegion(base, end);
         } else {
+            // EDEN_NX2_OLD_BLOCK_IDS=1 (A/B probe only): ids wrap after 65535 mappings as they
+            // did before PR 345, so a span over two mappings can look like one.
+            static const bool old_block_ids = [] {
+                const char* text = std::getenv("EDEN_NX2_OLD_BLOCK_IDS");
+                return text != nullptr && text[0] == '1';
+            }();
             u64 mapping_id = block_count.load(std::memory_order_relaxed);
             constexpr u64 exhausted_count =
                 u64{Common::PageTable::PageEntryData::INVALID_BLOCK_ID} + 1;
-            while (mapping_id < exhausted_count &&
+            if (old_block_ids) {
+                mapping_id = block_count.fetch_add(1, std::memory_order_relaxed) %
+                             Common::PageTable::PageEntryData::INVALID_BLOCK_ID;
+            }
+            while (!old_block_ids && mapping_id < exhausted_count &&
                    !block_count.compare_exchange_weak(mapping_id, mapping_id + 1,
                                                       std::memory_order_relaxed)) {
             }

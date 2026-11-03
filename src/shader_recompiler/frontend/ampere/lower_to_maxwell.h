@@ -47,11 +47,12 @@ struct LoweredProgram {
 // Maxwell frontend. These are new instructions, not reinterpretations of the
 // native bytes. Scheduling/control words are added by the environment adapter.
 /// SUST.P/SUATOM with a register or uniform-register handle (0x99c, 0xf9b, 0x394) are lowered
-/// only with EDEN_NX2_SURFACE_OPS set (not "0").
+/// unless EDEN_NX2_SURFACE_OPS=0. The handle types, pointer pairs and CPU-write protection that
+/// these programs need follow the same switch (each has its own override).
 inline bool SurfaceOpsEnabled() {
     static const bool enabled = [] {
         const char* text = std::getenv("EDEN_NX2_SURFACE_OPS");
-        return text && text[0] != '0';
+        return text == nullptr || text[0] != '0';
     }();
     return enabled;
 }

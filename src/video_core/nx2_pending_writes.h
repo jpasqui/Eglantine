@@ -18,14 +18,14 @@ namespace VideoCommon::Nx2PendingWrites {
 
 using Ranges = std::vector<std::pair<u64, u64>>;
 
-/// EDEN_NX2_PROTECT_CPU_WRITES=1/0; unset: on with EDEN_NX2_SURFACE_OPS only (runs with it
-/// lost the device 3 times in 7, the default env once in 1; cause not found).
+/// EDEN_NX2_PROTECT_CPU_WRITES=1/0; unset: on unless EDEN_NX2_SURFACE_OPS=0.
 inline bool Enabled() {
     static const bool enabled = [] {
         if (const char* value = std::getenv("EDEN_NX2_PROTECT_CPU_WRITES")) {
             return value[0] != '0';
         }
-        return std::getenv("EDEN_NX2_SURFACE_OPS") != nullptr;
+        const char* surface_ops = std::getenv("EDEN_NX2_SURFACE_OPS");
+        return surface_ops == nullptr || surface_ops[0] != '0';
     }();
     return enabled;
 }

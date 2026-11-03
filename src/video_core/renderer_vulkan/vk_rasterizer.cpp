@@ -51,6 +51,7 @@
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 #include "video_core/nx2_pending_writes.h"
+#include "video_core/nx2_vol_trace.h"
 #include "video_core/nx2_profile.h"
 
 namespace Vulkan {
@@ -455,8 +456,32 @@ void TraceWindowTarget(const Tegra::Engines::Maxwell3D& maxwell3d, Tegra::Memory
 }
 } // Anonymous namespace
 
+namespace {
+// EDEN_NX2_STALE_TRACE (see nx2_vol_trace.h): one line per draw of the traced frame.
+void LogStaleDraw(const Tegra::Engines::Maxwell3D& maxwell3d, std::string_view kind, u64 count, u64 instances,
+                  u64 indirect) {
+    const auto& regs = maxwell3d.regs;
+    const u64 vs = (u64{regs.pipelines[1].reserved[0] & 0xff} << 32) | regs.pipelines[1].reserved[1];
+    const u64 ps = (u64{regs.pipelines[5].reserved[0] & 0xff} << 32) | regs.pipelines[5].reserved[1];
+    const u32 draw = ++VideoCommon::Nx2VolTrace::StaleDraw();
+    LOG_INFO(HW_GPU,
+             "stale draw #{} {} count {} instances {} indirect {:#x} vs {:#x} ps {:#x} rt0 {:#x} {}x{} format {:#x} "
+             "rts {} zeta {:#x} on {} depth test {} func {:#x} write {} blend {}",
+             draw, kind, count, instances, indirect, vs, ps, regs.rt[0].Address(), regs.rt[0].width,
+             regs.rt[0].height, static_cast<u32>(regs.rt[0].format), regs.rt_control.count.Value(),
+             regs.zeta.Address(), regs.zeta_enable, regs.depth_test_enable,
+             static_cast<u32>(regs.depth_test_func), regs.depth_write_enabled, regs.blend.enable[0]);
+}
+} // namespace
+
 void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Draw};
+    if (VideoCommon::Nx2VolTrace::StaleActive()) {
+        LogStaleDraw(*maxwell3d, is_indexed ? "indexed" : "arrays",
+                     is_indexed ? maxwell3d->draw_manager.draw_state.index_buffer.count
+                                : maxwell3d->draw_manager.draw_state.vertex_buffer.count,
+                     instance_count, 0);
+    }
     TraceWindowTarget(*maxwell3d, *gpu_memory, is_indexed ? "draw-indexed" : "draw",
                       is_indexed ? maxwell3d->draw_manager.draw_state.index_buffer.count
                                  : maxwell3d->draw_manager.draw_state.vertex_buffer.count);
@@ -607,6 +632,10 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
 void RasterizerVulkan::DrawIndirect() {
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Draw};
     const auto& params = maxwell3d->draw_manager.indirect_state;
+    if (VideoCommon::Nx2VolTrace::StaleActive()) {
+        LogStaleDraw(*maxwell3d, params.include_count ? "indirect-count" : "indirect", params.max_draw_counts,
+                     params.include_count ? params.count_start_address : 0, params.indirect_start_address);
+    }
     buffer_cache.SetDrawIndirect(&params);
     PrepareDraw(params.is_indexed, [this, &params] {
         if (mesh_draw) {
