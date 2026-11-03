@@ -151,7 +151,7 @@ void MaxwellDMA::Launch() {
         VideoCommon::Nx2VolTrace::NoteRange(
             regs.offset_out, (std::max)(dst_size, u64{1}),
             fmt::format("dma from {:#x} {} multi {} remap {} const {:#x} dst_x {} comp {}x{} lines {} length {} "
-                        "pitch {}/{} dst {}x{}x{}",
+                        "pitch {}/{} dst {}x{}x{} block {}x{}x{} layer {} origin {},{}",
                         static_cast<u64>(regs.offset_in),
                         regs.launch_dma.src_memory_layout.Value() != LaunchDMA::MemoryLayout::PITCH
                             ? (dst_block ? "block->block" : "block->pitch")
@@ -161,7 +161,10 @@ void MaxwellDMA::Launch() {
                         regs.remap_const.num_dst_components_minus_one + 1,
                         regs.remap_const.component_size_minus_one + 1, regs.line_count, regs.line_length_in,
                         regs.pitch_in, regs.pitch_out, regs.dst_params.width, regs.dst_params.height,
-                        regs.dst_params.depth));
+                        regs.dst_params.depth, regs.dst_params.block_size.width.Value(),
+                        regs.dst_params.block_size.height.Value(), regs.dst_params.block_size.depth.Value(),
+                        regs.dst_params.layer, regs.dst_params.origin.x.Value(),
+                        regs.dst_params.origin.y.Value()));
     }
     // TODO(Subv): Perform more research and implement all features of this engine.
     const LaunchDMA& launch = regs.launch_dma;

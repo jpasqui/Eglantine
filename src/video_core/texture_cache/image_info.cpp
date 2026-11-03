@@ -122,11 +122,16 @@ ImageInfo::ImageInfo(const TICEntry& config) noexcept {
         resources.layers = 1;
         // A few distinct 3D descriptors, raw (to check Switch 2 volume fields).
         static std::vector<std::array<u64, 4>> logged;
-        if (logged.size() < 16 && std::find(logged.begin(), logged.end(), config.raw) == logged.end()) {
+        if ((logged.size() < 16 || (size.depth >= 16 && size.width <= 64 && logged.size() < 48)) &&
+            std::find(logged.begin(), logged.end(), config.raw) == logged.end()) {
             logged.push_back(config.raw);
-            LOG_INFO(HW_GPU, "3D TIC {:016x} {:016x} {:016x} {:016x}: {}x{}x{} block_depth {} levels {}",
+            LOG_INFO(HW_GPU, "3D TIC {:016x} {:016x} {:016x} {:016x}: {}x{}x{} block_height {} block_depth {} levels {} "
+                     "swizzle {}{}{}{}",
                      config.raw[0], config.raw[1], config.raw[2], config.raw[3], size.width, size.height,
-                     size.depth, config.block_depth.Value(), config.max_mip_level.Value() + 1);
+                     size.depth, config.block_height.Value(), config.block_depth.Value(),
+                     config.max_mip_level.Value() + 1, static_cast<u32>(config.x_source.Value()),
+                     static_cast<u32>(config.y_source.Value()), static_cast<u32>(config.z_source.Value()),
+                     static_cast<u32>(config.w_source.Value()));
         }
         break;
     }

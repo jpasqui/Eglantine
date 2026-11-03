@@ -290,6 +290,56 @@ void TextureCache<P>::ApplyThresholdOverrides(bool log) {
 template <class P>
 void TextureCache<P>::TickFrame() {
     Nx2VolTrace::RangeFrame().store(frame_tick, std::memory_order_relaxed);
+    if (const char* snap_dir = Nx2VolTrace::VolSnap(); snap_dir != nullptr && gpu_memory != nullptr) {
+        // (id, gpu address, GPU-modified) already saved.
+        static std::set<std::tuple<u32, u64, bool>> saved;
+        static u32 saves{};
+        std::vector<ImageId> todo;
+        for (const auto [image_id, image] : slot_images) {
+            if (image->info.type != ImageType::e3D || image->info.size.width > 64 ||
+                image->info.size.depth < 16 ||
+                True(image->flags & (ImageFlagBits::Unbacked | ImageFlagBits::Sparse))) {
+                continue;
+            }
+            const bool gpu = True(image->flags & ImageFlagBits::GpuModified);
+            if (saved.insert({image_id.index, image->gpu_addr, gpu}).second) {
+                todo.push_back(image_id);
+            }
+        }
+        for (const ImageId image_id : todo) {
+            if (saves >= 96) break;
+            Image& image = slot_images[image_id];
+            const u32 n = saves++;
+            const std::string base = fmt::format(
+                "{}/snap-{:02}-t{}-id{}-{:x}-f{}-{}x{}x{}-flags{:x}", snap_dir, n, frame_tick, image_id.index,
+                image.gpu_addr, static_cast<u32>(image.info.format), image.info.size.width,
+                image.info.size.height, image.info.size.depth, static_cast<u32>(image.flags));
+            auto map = runtime.DownloadStagingBuffer(image.unswizzled_size_bytes);
+            const auto copies = FullDownloadCopies(image.info);
+            image.DownloadMemory(map, copies);
+            runtime.Finish();
+            if (std::FILE* file = std::fopen((base + "-host.bin").c_str(), "wb")) {
+                std::fwrite(map.mapped_span.data(), 1, image.unswizzled_size_bytes, file);
+                std::fclose(file);
+            }
+            std::vector<u8> guest(std::min<size_t>(image.guest_size_bytes, 16_MiB));
+            gpu_memory->ReadBlockUnsafe(image.gpu_addr, guest.data(), guest.size());
+            if (std::FILE* file = std::fopen((base + "-guest.bin").c_str(), "wb")) {
+                std::fwrite(guest.data(), 1, guest.size(), file);
+                std::fclose(file);
+            }
+            LOG_INFO(HW_GPU,
+                     "vol snap {} frame {} id {} gpu {:#x} format {} {}x{}x{} levels {} block {}x{}x{} guest size {:#x} "
+                     "flags {:#x} host nonzero words {} guest nonzero words {}",
+                     n, frame_tick, image_id.index, image.gpu_addr, static_cast<u32>(image.info.format),
+                     image.info.size.width, image.info.size.height, image.info.size.depth,
+                     image.info.resources.levels, image.info.block.width, image.info.block.height,
+                     image.info.block.depth, image.guest_size_bytes, static_cast<u32>(image.flags),
+                     Nx2VolTrace::CountNonzeroWords(
+                         std::span<const u8>{map.mapped_span.data(), image.unswizzled_size_bytes}),
+                     Nx2VolTrace::CountNonzeroWords(std::span<const u8>{guest.data(), guest.size()}));
+        }
+    }
     // EDEN_NX2_VOL_DUMP=<frame>,<dir>: at that frame, write the host contents (linear, as the
     // cache holds them) of every 3D image of at least 16x16x16 to <dir>, without touching guest
     // memory, to compare lightmap volumes between runs.
@@ -680,6 +730,41 @@ void TextureCache<P>::FillImageViews(std::span<ImageViewInOut> views, bool compu
             }
         }
     } while (has_deleted_images || (blacklist && has_blacklisted));
+    if (static const auto null_sampled = [] {
+            std::vector<std::array<u32, 3>> result;
+            if (const char* value = std::getenv("EDEN_NX2_NULL_SAMPLED")) {
+                std::string text{value};
+                size_t start = 0;
+                while (start < text.size()) {
+                    const size_t comma = text.find(',', start);
+                    const std::string item = text.substr(start, comma == std::string::npos ? std::string::npos
+                                                                                          : comma - start);
+                    u32 w = 0, h = 0, f = 0;
+                    if (std::sscanf(item.c_str(), "%ux%uf%u", &w, &h, &f) == 3) {
+                        result.push_back({w, h, f});
+                    }
+                    if (comma == std::string::npos) break;
+                    start = comma + 1;
+                }
+                LOG_INFO(HW_GPU, "EDEN_NX2_NULL_SAMPLED: {} entries", result.size());
+            }
+            return result;
+        }();
+        !compute && !null_sampled.empty()) {
+        for (ImageViewInOut& view : views) {
+            if (view.id == NULL_IMAGE_VIEW_ID) continue;
+            const ImageViewBase& image_view = slot_image_views[view.id];
+            if (!image_view.image_id || image_view.IsBuffer()) continue;
+            const Image& image = slot_images[image_view.image_id];
+            for (const auto& [w, h, f] : null_sampled) {
+                if (image.info.size.width == w && image.info.size.height == h &&
+                    static_cast<u32>(image.info.format) == f) {
+                    view.id = NULL_IMAGE_VIEW_ID;
+                    break;
+                }
+            }
+        }
+    }
     if (Nx2VolTrace::StaleActive() && gpu_memory != nullptr) {
         static std::set<u32> seen;
         static u64 seen_frame = ~u64{0};
@@ -2249,6 +2334,29 @@ ImageViewId TextureCache<P>::CreateImageView(const TICEntry& raw_config) {
     const TICEntry config = TextureViewHeader(raw_config, native);
     const ImageInfo info(config);
     if (info.type == ImageType::Buffer) {
+        if (static const bool trace = std::getenv("EDEN_NX2_TIC_SWIZZLE_TRACE") != nullptr; trace) {
+            using Tegra::Texture::SwizzleSource;
+            // R001 / RG01 (one- and two-channel formats) are the usual swizzles and are skipped.
+            const bool usual = config.x_source == SwizzleSource::R &&
+                               (config.y_source == SwizzleSource::Zero || config.y_source == SwizzleSource::G) &&
+                               config.z_source == SwizzleSource::Zero &&
+                               (config.w_source == SwizzleSource::OneInt || config.w_source == SwizzleSource::OneFloat);
+            if ((!usual && (config.x_source != SwizzleSource::R || config.y_source != SwizzleSource::G ||
+                            config.z_source != SwizzleSource::B || config.w_source != SwizzleSource::A)) ||
+                info.format == PixelFormat::A8B8G8R8_UINT) {
+                static std::vector<std::array<u64, 4>> logged;
+                if (logged.size() < 64 &&
+                    std::find(logged.begin(), logged.end(), config.raw) == logged.end()) {
+                    logged.push_back(config.raw);
+                    LOG_INFO(HW_GPU,
+                             "buffer TIC swizzle {}{}{}{} format {} width {} at {:#x}: {:016x} {:016x} {:016x} {:016x}",
+                             static_cast<u32>(config.x_source.Value()), static_cast<u32>(config.y_source.Value()),
+                             static_cast<u32>(config.z_source.Value()), static_cast<u32>(config.w_source.Value()),
+                             static_cast<u32>(info.format), info.size.width, config.Address(), config.raw[0],
+                             config.raw[1], config.raw[2], config.raw[3]);
+                }
+            }
+        }
         const ImageViewInfo view_info(config, 0);
         return slot_image_views.insert(runtime, info, view_info, config.Address());
     }

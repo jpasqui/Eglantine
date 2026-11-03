@@ -1316,6 +1316,8 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
     // A handle program has no descriptor to read a type from, and ImageQueryDimensions carries
     // none: it takes the type of another instruction using the same handle.
     std::unordered_map<u32, TextureType> handle_program_types;
+    // Round 21: the type of a storage instruction on the same handle (the last resort for a query).
+    std::unordered_map<u32, TextureType> handle_program_storage_types;
     for (const TextureInst& texture_inst : to_replace) {
         const IR::Opcode opcode{IndexedInstruction(*texture_inst.inst)};
         if (texture_inst.cbuf.handle_program != ~0U && opcode != IR::Opcode::ImageQueryDimensions &&
@@ -1324,7 +1326,17 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
                 texture_inst.cbuf.handle_program,
                 texture_inst.inst->Flags<IR::TextureInstInfo>().type.Value());
         }
+        if (texture_inst.cbuf.handle_program != ~0U && IsStorageImageOpcode(opcode)) {
+            handle_program_storage_types.try_emplace(
+                texture_inst.cbuf.handle_program,
+                texture_inst.inst->Flags<IR::TextureInstInfo>().type.Value());
+        }
     }
+    static const bool txq_handle_types = [] {
+        // Opt-in (EDEN_NX2_TXQ_HANDLE_TYPES=1): proven by volume dumps, not yet by frames.
+        const char* text = std::getenv("EDEN_NX2_TXQ_HANDLE_TYPES");
+        return text != nullptr && std::string_view{text} != "0";
+    }();
     for (TextureInst& texture_inst : to_replace) {
         // TODO: Handle arrays
         IR::Inst* const inst{texture_inst.inst};
@@ -1338,6 +1350,26 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
             if (const auto it{handle_program_types.find(cbuf.handle_program)};
                 it != handle_program_types.end()) {
                 flags.type.Assign(it->second);
+            } else if (cbuf.handle_program != ~0U && txq_handle_types) {
+                // No sampled instruction shares the handle: the selected descriptor's type, else a
+                // storage instruction's on the same handle, else 2D.
+                const std::optional<TextureType> selected{
+                    HandleProgramTextureType(env, program.info, cbuf.handle_program)};
+                const auto storage{handle_program_storage_types.find(cbuf.handle_program)};
+                const TextureType type{selected ? *selected
+                                       : storage != handle_program_storage_types.end()
+                                           ? storage->second
+                                           : TextureType::Color2D};
+                flags.type.Assign(type);
+                if (static const bool trace = std::getenv("EDEN_NX2_HANDLE_FORMAT_TRACE") != nullptr;
+                    trace) {
+                    LOG_INFO(Shader, "handle query type: stage {} handle program {}: type {} ({})",
+                             static_cast<int>(program.stage), cbuf.handle_program,
+                             static_cast<int>(type),
+                             selected ? "descriptor"
+                             : storage != handle_program_storage_types.end() ? "storage instruction"
+                                                                             : "default 2D");
+                }
             } else {
                 flags.type.Assign(ReadTextureTypeCached(env, cbuf));
             }
