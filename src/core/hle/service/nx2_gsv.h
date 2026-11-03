@@ -1774,6 +1774,15 @@ private:
             m_stats.max_fence_us = (std::max<long long>)(m_stats.max_fence_us, static_cast<long long>(to_us(waited - entered)));
             if (m_stats.last_present != std::chrono::steady_clock::time_point{}) {
                 const long long frame = to_us(entered - m_stats.last_present);
+                // EDEN_NX2_PRESENT_TIMES=1: every present's interval, 60 to a log line.
+                static const bool present_times = std::getenv("EDEN_NX2_PRESENT_TIMES") != nullptr;
+                if (present_times) {
+                    m_present_times += fmt::format("{}{}", m_present_times.empty() ? "" : ",", frame);
+                    if ((m_presents % 60) == 0) {
+                        LOG_INFO(Service, "nx2:vi2 present times #{}: {}", m_presents, m_present_times);
+                        m_present_times.clear();
+                    }
+                }
                 m_stats.frame_us += frame;
                 m_stats.max_frame_us = (std::max)(m_stats.max_frame_us, frame);
                 m_stats.hitches += frame > 100'000 ? 1 : 0;
@@ -1807,6 +1816,7 @@ private:
         u32 presents{};
         std::chrono::steady_clock::time_point last_present{};
     } m_stats{};
+    std::string m_present_times; ///< EDEN_NX2_PRESENT_TIMES: intervals since the last line
     u32 m_previous_fence_id{~0U}; // none yet (WaitForFrame ignores ids >= 192)
     u32 m_previous_fence_value{};
 
