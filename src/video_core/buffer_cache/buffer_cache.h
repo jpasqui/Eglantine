@@ -19,6 +19,7 @@
 #include "video_core/buffer_cache/uniform_stream_reuse.h"
 #include "video_core/guest_memory.h"
 #include "video_core/nx2_pending_writes.h"
+#include "video_core/nx2_pb_trace.h"
 #include "video_core/nx2_vol_trace.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/nx2.h"
@@ -828,6 +829,8 @@ void BufferCache<P>::PopAsyncBuffers() {
                 LOG_INFO(HW_GPU, "buffer trace: async download {:#x} size {:#x} into guest memory",
                          start, end - start);
             }
+            const VideoCommon::Nx2PbTrace::WriteWatch watch{"buffer download (async)",
+                                                            device_memory, start, end - start};
             device_memory.WriteBlockUnsafe(start, &read_mapped_memory[start - device_addr],
                                            end - start);
         });
@@ -1746,6 +1749,7 @@ void BufferCache<P>::MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u3
     memory_tracker.MarkRegionAsGpuModified(device_addr, size);
     MarkVertexBuffersStale(device_addr, size);
     gpu_modified_ranges.Add(device_addr, size);
+    VideoCommon::Nx2VolTrace::NoteDeviceWrite(device_addr, size);
     if (DownloadsAtFence(device_addr, size)) {
         uncommitted_gpu_modified_ranges.Add(device_addr, size);
     } else {
@@ -2362,6 +2366,8 @@ void BufferCache<P>::DownloadBuffersMemory(std::span<const BufferId> buffer_ids)
     const u8* const mapped_memory = download_staging.mapped_span.data();
     for (const Download& download : downloads) {
         const DAddr device_addr = slot_buffers[download.buffer_id].CpuAddr() + download.copy.src_offset;
+        const VideoCommon::Nx2PbTrace::WriteWatch watch{"buffer download (buffers)", device_memory,
+                                                        device_addr, download.copy.size};
         device_memory.WriteBlockUnsafe(
             device_addr, mapped_memory + (download.copy.dst_offset - download_staging.offset),
             download.copy.size);
@@ -2419,6 +2425,8 @@ void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64
                 LOG_INFO(HW_GPU, "buffer trace: download {:#x} size {:#x} into guest memory",
                          copy_device_addr, copy.size);
             }
+            const VideoCommon::Nx2PbTrace::WriteWatch watch{"buffer download", device_memory,
+                                                            copy_device_addr, copy.size};
             VideoCommon::Nx2PendingWrites::WriteExceptPending(device_memory, copy_device_addr,
                                                               copy_mapped_memory, copy.size);
         }
@@ -2427,6 +2435,9 @@ void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64
         for (const BufferCopy& copy : copies) {
             buffer.ImmediateDownload(copy.src_offset, immediate_buffer.subspan(0, copy.size));
             const DAddr copy_device_addr = buffer.CpuAddr() + copy.src_offset;
+            const VideoCommon::Nx2PbTrace::WriteWatch watch{"buffer download (immediate)",
+                                                            device_memory, copy_device_addr,
+                                                            copy.size};
             VideoCommon::Nx2PendingWrites::WriteExceptPending(device_memory, copy_device_addr,
                                                               immediate_buffer.data(), copy.size);
         }

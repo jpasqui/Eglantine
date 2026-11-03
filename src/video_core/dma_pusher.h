@@ -194,7 +194,14 @@ public:
     /// and straight from guest memory, to find pushbuffer desyncs. Debug aid for Switch 2.
     void DumpCurrentEntry(const char* reason);
     void CheckSubmitHash(const CommandListHeader& header, u64 submit_hash);
-    void RecordParsedEntry(const CommandListHeader& header, std::span<const CommandHeader> commands);
+    /// How the words of a GP entry were read (shown by DumpCurrentEntry).
+    enum class EntryReadPath : u8 { None, Prefetch, Submitted, Safe, GpuWritten, Unsafe };
+    static const char* ReadPathName(EntryReadPath path);
+    void RecordParsedEntry(const CommandListHeader& header, std::span<const CommandHeader> commands,
+                           EntryReadPath path);
+    /// Pushbuffer desync guard (Switch 2): the header at commands[index] cannot start a command.
+    /// Logs it and returns whether the rest of the entry is dropped.
+    bool OnDesyncHeader(std::span<const CommandHeader> commands, size_t index, size_t word_offset);
     /// Whether the entry lies on device pages the GPU has written (NX2).
     bool IsGpuWrittenCommands(GPUVAddr address, size_t size);
     /// Reads a command list on pages the GPU wrote into command_headers, from the copies the
@@ -248,7 +255,13 @@ public:
         GPUVAddr address;
         u32 size;
         u64 hash;
+        EntryReadPath path;
     };
+    // The entry being parsed: its words as read (the span ProcessCommands started from) and how.
+    EntryReadPath current_read_path{EntryReadPath::None};
+    const CommandHeader* current_words{};
+    size_t current_word_count{};
+    u32 desync_entries{}; ///< Entries the desync guard fired in
     std::array<ParsedEntry, 64> parsed_entries{};
     size_t parsed_entry_count{};
     std::vector<ParkedMethod> parked_methods;

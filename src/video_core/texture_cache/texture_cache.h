@@ -38,6 +38,7 @@
 #include "video_core/nx2.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/nx2_pending_writes.h"
+#include "video_core/nx2_pb_trace.h"
 #include "video_core/nx2_vol_trace.h"
 #include "video_core/textures/decoders.h"
 
@@ -175,6 +176,8 @@ void TextureCache<P>::RunGarbageCollector() {
             const auto copies = FullDownloadCopies(image.info);
             image.DownloadMemory(map, copies);
             runtime.Finish();
+            const Nx2PbTrace::WriteWatch watch{"image download (eviction)", device_memory,
+                                               image.cpu_addr, image.guest_size_bytes};
             SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, map.mapped_span, swizzle_data_buffer);
             ++gc_download_deletes;
         }
@@ -610,7 +613,42 @@ void TextureCache<P>::MarkModification(ImageId id) noexcept {
 }
 
 template <class P>
+void TextureCache<P>::Nx2LogImageValues(const char* tag, ImageId image_id) {
+    if (!image_id) {
+        return;
+    }
+    Image& image = slot_images[image_id];
+    if (True(image.flags & (ImageFlagBits::Unbacked | ImageFlagBits::Sparse))) {
+        return;
+    }
+    const auto [kind, bpt] = Nx2VolTrace::ValueKind(static_cast<u32>(image.info.format));
+    if (kind == 0) {
+        LOG_INFO(HW_GPU, "pass values {} #{} id {} gpu {:#x} {}x{}x{} format {}: not decoded", tag,
+                 Nx2VolTrace::StaleDraw().load(), image_id.index, image.gpu_addr, image.info.size.width,
+                 image.info.size.height, image.info.size.depth, static_cast<u32>(image.info.format));
+        return;
+    }
+    auto map = runtime.DownloadStagingBuffer(image.unswizzled_size_bytes);
+    const auto copies = FullDownloadCopies(image.info);
+    image.DownloadMemory(map, copies);
+    runtime.Finish();
+    const std::span<const u8> host{map.mapped_span.data(), image.unswizzled_size_bytes};
+    const u64 texels = u64{image.info.size.width} * image.info.size.height * image.info.size.depth;
+    LOG_INFO(HW_GPU, "pass values {} #{} id {} gpu {:#x} {}x{}x{} format {}:{}", tag,
+             Nx2VolTrace::StaleDraw().load(), image_id.index, image.gpu_addr, image.info.size.width,
+             image.info.size.height, image.info.size.depth, static_cast<u32>(image.info.format),
+             Nx2VolTrace::ValueStats(kind, bpt, host, texels));
+}
+
+template <class P>
 void TextureCache<P>::FillImageViews(std::span<ImageViewInOut> views, bool compute, bool blacklist) {
+    if (!nx2_dispatch_value_images.empty()) {
+        auto images = std::move(nx2_dispatch_value_images);
+        nx2_dispatch_value_images.clear();
+        for (const ImageId id : images) {
+            Nx2LogImageValues("after dispatch", id);
+        }
+    }
     bool has_blacklisted = false;
     do {
         has_deleted_images = false;
@@ -643,9 +681,36 @@ void TextureCache<P>::FillImageViews(std::span<ImageViewInOut> views, bool compu
                 continue;
             }
             const ImageViewBase& image_view = slot_image_views[view.id];
-            if (!image_view.image_id) {
-                list += fmt::format(" {:x}:buf{:#x}", view.index, image_view.gpu_addr);
+            if (!image_view.image_id || image_view.IsBuffer()) {
+                list += fmt::format(" {:x}:buf@{:#x}/f{}", view.index, image_view.gpu_addr,
+                                    static_cast<u32>(image_view.format));
+                // First use in the frame: the first texels from guest memory.
+                static std::set<u64> buffers_seen;
+                static u64 buffers_frame = ~u64{0};
+                if (buffers_frame != frame_tick) {
+                    buffers_seen.clear();
+                    buffers_frame = frame_tick;
+                }
+                if (image_view.gpu_addr != 0 && buffers_seen.insert(image_view.gpu_addr).second) {
+                    std::array<float, 64> words{};
+                    gpu_memory->ReadBlockUnsafe(image_view.gpu_addr, words.data(), sizeof(words));
+                    bool gpu_written = false;
+                    if (const auto device = gpu_memory->GpuToCpuAddress(image_view.gpu_addr);
+                        device && Nx2VolTrace::BufferGpuModifiedHook()) {
+                        gpu_written = Nx2VolTrace::BufferGpuModifiedHook()(*device, sizeof(words));
+                    }
+                    std::string values;
+                    for (const float word : words) {
+                        values += fmt::format(" {:.4g}", word);
+                    }
+                    LOG_INFO(HW_GPU, "stale buffer view {:#x} format {} size {}{}:{}", image_view.gpu_addr,
+                             static_cast<u32>(image_view.format), image_view.size.width,
+                             gpu_written ? " G" : "", values);
+                }
                 continue;
+            }
+            if (compute && Nx2VolTrace::PassValues()) {
+                nx2_dispatch_value_images.push_back(image_view.image_id);
             }
             const ImageId image_id = image_view.image_id;
             Image& image = slot_images[image_id];
@@ -994,6 +1059,15 @@ void TextureCache<P>::UpdateRenderTargets(bool is_clear) {
 
     if (render_targets != previous_render_targets) {
         ++render_targets_serial;
+        if (Nx2VolTrace::StaleActive() && Nx2VolTrace::PassValues()) {
+            // The pass that just ended: what it left in its colour targets.
+            for (size_t index = 0; index < NUM_RT; ++index) {
+                const ImageViewId view = previous_render_targets.color_buffer_ids[index];
+                if (view) {
+                    Nx2LogImageValues("before draw", slot_image_views[view].image_id);
+                }
+            }
+        }
         if (Nx2VolTrace::StaleActive()) {
             std::string list;
             for (size_t index = 0; index < NUM_RT; ++index) {
@@ -1157,6 +1231,8 @@ void TextureCache<P>::DownloadMemory(DAddr cpu_addr, size_t size) {
         const auto copies = FullDownloadCopies(image.info);
         image.DownloadMemory(map, copies);
         runtime.Finish();
+        const Nx2PbTrace::WriteWatch watch{"image download (flush)", device_memory, image.cpu_addr,
+                                           image.guest_size_bytes};
         SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, map.mapped_span,
                      swizzle_data_buffer);
     }
@@ -1560,11 +1636,16 @@ void TextureCache<P>::PopAsyncFlushes() {
                 download_buffer.offset -= Common::AlignUp(image.unswizzled_size_bytes, 64);
                 std::span<u8> download_span =
                     download_buffer.mapped_span.subspan(download_buffer.offset);
+                const Nx2PbTrace::WriteWatch watch{"image download (async)", device_memory,
+                                                   image.cpu_addr, image.guest_size_bytes};
                 SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, download_span, swizzle_data_buffer);
             } else {
                 const BufferDownload& buffer_info = slot_buffer_downloads[download_info.object_id];
                 std::span<u8> download_span =
                     download_buffer.mapped_span.subspan(download_buffer.offset);
+                const Nx2PbTrace::WriteWatch watch{
+                    "dma buffer download (async)", device_memory,
+                    gpu_memory->GpuToCpuAddress(buffer_info.address).value_or(0), buffer_info.size};
                 gpu_memory->WriteBlockUnsafe(buffer_info.address, download_span.data(),
                                              buffer_info.size);
                 slot_buffer_downloads.erase(download_info.object_id);
@@ -1608,7 +1689,11 @@ void TextureCache<P>::PopAsyncFlushes() {
             }
             const ImageBase& image = download_info.GetImage(slot_images);
             const auto copies = FullDownloadCopies(image.info);
-            SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, download_span, swizzle_data_buffer);
+            {
+                const Nx2PbTrace::WriteWatch watch{"image download (committed)", device_memory,
+                                                   image.cpu_addr, image.guest_size_bytes};
+                SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, download_span, swizzle_data_buffer);
+            }
             download_map.offset += image.unswizzled_size_bytes;
             download_span = download_span.subspan(image.unswizzled_size_bytes);
         }
@@ -1776,11 +1861,12 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
             if (logged.insert({image.gpu_addr, static_cast<u32>(image.info.format)}).second) {
                 LOG_INFO(HW_GPU,
                          "upload over GPU-written buffer data: image id {} gpu {:#x} device {:#x} size {:#x} type {} "
-                         "{}x{}x{} format {} frame {}{}",
+                         "{}x{}x{} format {} frame {}{}; written by:{}",
                          image_id.index, image.gpu_addr, image.cpu_addr, image.guest_size_bytes,
                          static_cast<u32>(image.info.type), image.info.size.width, image.info.size.height,
                          image.info.size.depth, static_cast<u32>(image.info.format), frame_tick,
-                         Nx2VolTrace::UploadSync() ? " (synced)" : "");
+                         Nx2VolTrace::UploadSync() ? " (synced)" : "",
+                         Nx2VolTrace::DeviceWritesOverlapping(image.cpu_addr, image.guest_size_bytes));
             }
         }
         if (Nx2VolTrace::UploadSync() && Nx2VolTrace::BufferDownloadHook()) {
@@ -3077,6 +3163,16 @@ ImageViewId TextureCache<P>::FindDepthBuffer() {
 
 template <class P>
 ImageViewId TextureCache<P>::FindRenderTargetView(const ImageInfo& info, GPUVAddr gpu_addr) {
+    // Render target registers filled by garbage commands (sizes like 2147487260x2147485323, or
+    // 0x0 with 36232 layers): creating the image would abort. (PR #329, 0f89b1cd.)
+    static constexpr u32 MaxRenderTargetSize = 32768;
+    static constexpr s32 MaxRenderTargetLayers = 2048;
+    if (info.size.width == 0 || info.size.height == 0 || info.size.width > MaxRenderTargetSize ||
+        info.size.height > MaxRenderTargetSize || info.resources.layers > MaxRenderTargetLayers) {
+        LOG_ERROR(HW_GPU, "Ignoring {}x{} render target with {} layers at {:#x}", info.size.width,
+                  info.size.height, info.resources.layers, gpu_addr);
+        return ImageViewId{}; // No render target: the null view has no format to size
+    }
     ImageId image_id{};
     bool delete_state = has_deleted_images;
     do {

@@ -15,6 +15,7 @@
 #include "common/common_types.h"
 #include <cmath>
 #include <functional>
+#include <unordered_map>
 #include <string>
 #include <fmt/format.h>
 
@@ -270,6 +271,64 @@ inline std::vector<RangeEvent> RangeEventsOverlapping(u64 gpu_addr, u64 size) {
     return result;
 }
 
+/// With EDEN_NX2_RANGE_HISTORY: the program of the draw (pixel shader) or dispatch being run, for NoteDeviceWrite.
+inline std::atomic<u64>& CurrentProgram() {
+    static std::atomic<u64> program{};
+    return program;
+}
+
+/// Buffer-cache GPU writes (device ranges): first and last frame, count and the program of the last one.
+struct DeviceWrite {
+    u64 addr;
+    u64 size;
+    u64 first_frame;
+    u64 last_frame;
+    u64 count;
+    u64 program;
+};
+
+inline std::mutex& DeviceWriteMutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+inline std::unordered_map<u64, DeviceWrite>& DeviceWrites() {
+    static std::unordered_map<u64, DeviceWrite> writes;
+    return writes;
+}
+
+/// Records a buffer-cache GPU write; a repeat of a range and program only updates it (at most 50000 kept).
+inline void NoteDeviceWrite(u64 addr, u64 size) {
+    if (!RangeHistory() || size == 0) return;
+    const u64 program = CurrentProgram().load(std::memory_order_relaxed);
+    const u64 frame = RangeFrame().load(std::memory_order_relaxed);
+    const u64 key = (addr * 0x9e3779b97f4a7c15ULL) ^ (size * 0xc2b2ae3d27d4eb4fULL) ^ program;
+    std::scoped_lock lock{DeviceWriteMutex()};
+    auto& writes = DeviceWrites();
+    if (const auto it = writes.find(key); it != writes.end()) {
+        it->second.last_frame = frame;
+        ++it->second.count;
+        return;
+    }
+    if (writes.size() < 50000) {
+        writes.emplace(key, DeviceWrite{addr, size, frame, frame, 1, program});
+    }
+}
+
+/// "addr+size frames a-b xN program P" for the recorded writes overlapping a device range (at most 12).
+inline std::string DeviceWritesOverlapping(u64 addr, u64 size) {
+    std::scoped_lock lock{DeviceWriteMutex()};
+    std::string text;
+    u32 shown = 0;
+    for (const auto& [key, write] : DeviceWrites()) {
+        if (write.addr < addr + size && addr < write.addr + write.size && shown++ < 12) {
+            text += fmt::format(" [{:#x}+{:#x} frames {}-{} x{} program {:#x}]", write.addr, write.size,
+                                write.first_frame, write.last_frame, write.count, write.program);
+        }
+    }
+    return text.empty() ? std::string{" (no recorded buffer writes)"} : text;
+}
+
 /// Set by the Vulkan rasterizer: whether the buffer cache holds GPU-written data in a device range, and downloading it
 /// into guest memory (the callers hold both caches' mutexes).
 inline std::function<bool(u64, u64)>& BufferGpuModifiedHook() {
@@ -289,6 +348,45 @@ inline bool UploadSync() {
         return value != nullptr && value[0] != '0';
     }();
     return enabled;
+}
+
+/// EDEN_NX2_PASS_VALUES: with the stale trace, statistics of each pass's colour targets when the targets change, and
+/// of the images a traced dispatch bound, right after it.
+inline bool PassValues() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_PASS_VALUES");
+        return value != nullptr && value[0] != '0';
+    }();
+    return enabled;
+}
+
+/// EDEN_NX2_STALE_CBUFS=<first>-<last>: the traced draws whose constant buffers are scanned (0-0: none).
+inline std::pair<u32, u32> StaleCbufDraws() {
+    static const std::pair<u32, u32> range = [] {
+        const char* value = std::getenv("EDEN_NX2_STALE_CBUFS");
+        if (value == nullptr) return std::pair<u32, u32>{0, 0};
+        char* end = nullptr;
+        const u32 first = static_cast<u32>(std::strtoul(value, &end, 10));
+        const u32 last = (end && *end == '-') ? static_cast<u32>(std::strtoul(end + 1, nullptr, 10)) : first;
+        return std::pair<u32, u32>{first, last};
+    }();
+    return range;
+}
+
+/// ValueStats kind and bytes per texel for a VideoCore::Surface::PixelFormat value ({0, 0}: not decoded).
+inline std::pair<u32, u32> ValueKind(u32 pixel_format) {
+    switch (pixel_format) {
+    case 16: return {1, 8};  // R16G16B16A16_FLOAT
+    case 21: return {2, 4};  // B10G11R11_FLOAT
+    case 35: return {3, 16}; // R32G32B32A32_FLOAT
+    case 39: return {4, 4};  // R32_FLOAT
+    case 40: return {5, 2};  // R16_FLOAT
+    case 37: return {6, 8};  // R32G32_FLOAT
+    case 46: return {7, 4};  // R16G16_FLOAT
+    case 0: case 34: case 51: case 63: return {8, 4}; // RGBA8 / BGRA8, unorm and srgb
+    case 7: return {9, 4};   // A2B10G10R10_UNORM
+    default: return {0, 0};
+    }
 }
 
 /// EDEN_NX2_STALE_VALUES: with the stale trace, value statistics of each sampled image at the end of the frame.

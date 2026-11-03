@@ -239,6 +239,10 @@ if (BOOST_NO_HEADERS)
 else()
     target_link_libraries(common PUBLIC Boost::headers)
 endif()
+if (TARGET scm_rev_refresh)
+    add_dependencies(common scm_rev_refresh)
+endif()
+
 target_link_libraries(common PRIVATE OpenSSL::SSL)
 target_link_libraries(common PUBLIC Boost::filesystem Boost::context httplib::httplib nlohmann_json::nlohmann_json)
 

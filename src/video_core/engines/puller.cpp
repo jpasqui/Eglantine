@@ -228,6 +228,7 @@ void Puller::ProcessBindMethod(DmaPusher& dma_pusher, const MethodCall& method_c
     }
 
     const auto engine_id = static_cast<EngineID>(engine);
+    const auto previous_engine = bound_engines[method_call.subchannel];
     bound_engines[method_call.subchannel] = engine_id;
     switch (engine_id) {
     case EngineID::FERMI_TWOD_A:
@@ -249,6 +250,18 @@ void Puller::ProcessBindMethod(DmaPusher& dma_pusher, const MethodCall& method_c
         dma_pusher.BindSubchannel(&dma_pusher.channel_state.payload->nv01_timer, method_call.subchannel, EngineTypes::Nv01Timer);
         break;
     default:
+        if (g_nx2_ampere) {
+            // Switch 2 binds only the classes above; anything else is a command word read as a
+            // header (round 19: a0110e96 after a pushbuffer desync). Keep the subchannel as it was.
+            bound_engines[method_call.subchannel] = previous_engine;
+            static std::atomic<u32> reported{};
+            if (reported.fetch_add(1) < 16) {
+                LOG_WARNING(HW_GPU, "Not binding unknown engine {:#x} to subchannel {} (channel {})",
+                            method_call.argument, method_call.subchannel,
+                            dma_pusher.channel_state.bind_id);
+            }
+            return;
+        }
         UNIMPLEMENTED_MSG("Unimplemented engine {:04X}", engine_id);
         break;
     }

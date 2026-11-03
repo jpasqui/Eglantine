@@ -25,6 +25,7 @@
 #include "video_core/gpu.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/memory_manager.h"
+#include "video_core/nx2_pb_trace.h"
 
 namespace Service::Nvidia::Devices {
 namespace {
@@ -461,6 +462,21 @@ NvResult nvhost_gpu::SubmitGPFIFOImpl(IoctlSubmitGpfifo& params, Tegra::CommandL
                 channel_state->memory_manager->ReadBlockUnsafe(
                     entry.addr, entries.submitted_words.data() + offset, entry.size * sizeof(u32));
                 offset += entry.size;
+            }
+        }
+        // EDEN_NX2_PB_WRITE_TRACE: remember the entries' device pages (piece by GPU page).
+        if (VideoCommon::Nx2PbTrace::Enabled() && channel_state->memory_manager) {
+            for (const auto& entry : entries.command_lists) {
+                const u64 begin = entry.addr.Value();
+                const u64 end = begin + u64{entry.size.Value()} * sizeof(u32);
+                for (u64 piece = begin; piece < end;) {
+                    const u64 piece_end = (std::min)(end, (piece & ~u64{0xfff}) + 0x1000);
+                    if (const auto device = channel_state->memory_manager->GpuToCpuAddress(piece)) {
+                        VideoCommon::Nx2PbTrace::NoteSubmitted(*device, piece_end - piece,
+                                                               static_cast<u32>(bind_id));
+                    }
+                    piece = piece_end;
+                }
             }
         }
     }

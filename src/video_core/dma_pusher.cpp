@@ -23,6 +23,7 @@
 #include "video_core/guest_memory.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
+#include "video_core/nx2_pb_trace.h"
 #include "video_core/rasterizer_interface.h"
 
 namespace Tegra {
@@ -81,6 +82,9 @@ bool DmaPusher::Step() {
 
     if (prefetch_size > 0) {
         const std::span<const CommandHeader> commands{command_list.prefetch_command_list};
+        current_read_path = EntryReadPath::Prefetch;
+        current_words = commands.data();
+        current_word_count = commands.size();
         command_resume_offset +=
             ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
         if (puller.HasPendingAcquire()) {
@@ -174,24 +178,24 @@ bool DmaPusher::Step() {
                 command_list.submitted_words.data() +
                     command_list.submitted_offsets[dma_pushbuffer_subindex],
                 header.size};
-            RecordParsedEntry(header, commands);
+            RecordParsedEntry(header, commands, EntryReadPath::Submitted);
             command_resume_offset += ProcessCommands(commands, 0);
         } else if (use_safe) {
             Tegra::Memory::GpuGuestMemory<Tegra::CommandHeader, Tegra::Memory::GuestMemoryFlags::SafeRead>headers(memory_manager, dma_state.dma_get, header.size, &command_headers);
             const std::span<const CommandHeader> commands{headers.data(), headers.size()};
-            RecordParsedEntry(header, commands);
+            RecordParsedEntry(header, commands, EntryReadPath::Safe);
             command_resume_offset +=
                 ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
         } else if (ReadGpuWrittenCommands(dma_state.dma_get, static_cast<u32>(header.size))) {
             const std::span<const CommandHeader> commands{command_headers.data(), header.size};
-            RecordParsedEntry(header, commands);
+            RecordParsedEntry(header, commands, EntryReadPath::GpuWritten);
             command_resume_offset +=
                 ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
         } else {
             FlushGpuWrittenCommands(dma_state.dma_get, size_t{header.size} * sizeof(u32));
             Tegra::Memory::GpuGuestMemory<Tegra::CommandHeader, Tegra::Memory::GuestMemoryFlags::UnsafeRead>headers(memory_manager, dma_state.dma_get, header.size, &command_headers);
             const std::span<const CommandHeader> commands{headers.data(), headers.size()};
-            RecordParsedEntry(header, commands);
+            RecordParsedEntry(header, commands, EntryReadPath::Unsafe);
             command_resume_offset +=
                 ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
         }
@@ -236,6 +240,102 @@ bool DmaPusher::Step() {
     return true;
 }
 
+// Pushbuffer desync guard (Switch 2, round 19). In u03 the parser reached 16 words of colour data
+// inside a valid entry (a 64-byte granule of foreign data), skipped them as mode 7 headers, took
+// the next data word (1.0f) as an increasing write to method 0 with 8064 words, bound a garbage
+// engine and filled Maxwell3D state with command words (zeta format 0x200503f8), then crashed.
+// NVN never emits these headers, so the rest of such an entry is dropped instead.
+// EDEN_NX2_PB_DESYNC_GUARD=0: off; =log: detect and log only; unset or anything else: on.
+enum class DesyncGuard { Off, Log, On };
+static const DesyncGuard g_desync_guard = [] {
+    const char* value = std::getenv("EDEN_NX2_PB_DESYNC_GUARD");
+    if (value == nullptr) {
+        return DesyncGuard::On;
+    }
+    if (value[0] == '0') {
+        return DesyncGuard::Off;
+    }
+    return value[0] == 'l' || value[0] == 'L' || value[0] == '2' ? DesyncGuard::Log : DesyncGuard::On;
+}();
+
+static bool IsDesyncHeader(const CommandHeader& header) {
+    if (g_desync_guard == DesyncGuard::Off) {
+        return false;
+    }
+    constexpr u32 host_methods = 0x40;
+    switch (header.mode) {
+    case SubmissionMode::IncreasingOld:
+        return header.argument != 0;
+    case SubmissionMode::Increasing:
+        return header.method < host_methods && header.method + header.method_count > host_methods;
+    case SubmissionMode::IncreaseOnce:
+        return header.method < host_methods && header.method_count > 1 &&
+               header.method + 1 >= host_methods;
+    case SubmissionMode::NonIncreasing:
+    case SubmissionMode::Inline:
+        return false;
+    default: // 2 (old non-increasing), 6, 7
+        return true;
+    }
+}
+
+bool DmaPusher::OnDesyncHeader(std::span<const CommandHeader> commands, size_t index,
+                               size_t word_offset) {
+    static std::atomic<u64> total{};
+    static std::atomic<u32> dumped{};
+    const CommandHeader header = commands[index];
+    const bool drop = g_desync_guard == DesyncGuard::On;
+    const u64 count = total.fetch_add(1) + 1;
+    const size_t word = word_offset + index;
+    const GPUVAddr address = dma_state.dma_get + word * sizeof(u32);
+    if (dumped.fetch_add(1) == 0) {
+        LOG_WARNING(HW_GPU,
+                    "Pushbuffer desync guard: header {:08x} (mode {}, method {:#x}, sub {}, count "
+                    "{}) at {:#x} (word {:#x} of the entry, read {}) cannot start a command; {}",
+                    header.argument, static_cast<u32>(header.mode.Value()), header.method.Value(),
+                    header.subchannel.Value(), header.method_count.Value(), address, word,
+                    ReadPathName(current_read_path),
+                    drop ? "dropping the rest of the entry" : "logging only");
+        DumpCurrentEntry("desync guard");
+        if (const auto device = memory_manager.GpuToCpuAddress(dma_state.dma_get)) {
+            VideoCommon::Nx2PbTrace::ReportOverlapping(*device, (word_offset + commands.size()) *
+                                                                    sizeof(u32));
+        }
+    }
+    if (++desync_entries <= 64 || (count % 1000) == 0) {
+        LOG_WARNING(HW_GPU,
+                    "Pushbuffer desync guard #{} (entry {} on ch {}): {:08x} at {:#x}, word {:#x} "
+                    "of {:#x}, read {}, {} {} words",
+                    count, desync_entries, channel_state.bind_id, header.argument, address, word,
+                    word_offset + commands.size(), ReadPathName(current_read_path),
+                    drop ? "dropped" : "kept", commands.size() - index);
+    }
+    if (!drop) {
+        return false;
+    }
+    dma_state.method_count = 0;
+    dma_state.non_incrementing = false;
+    dma_increment_once = false;
+    return true;
+}
+
+const char* DmaPusher::ReadPathName(EntryReadPath path) {
+    switch (path) {
+    case EntryReadPath::Prefetch:
+        return "prefetch";
+    case EntryReadPath::Submitted:
+        return "submitted copy";
+    case EntryReadPath::Safe:
+        return "safe read";
+    case EntryReadPath::GpuWritten:
+        return "gpu-written copy";
+    case EntryReadPath::Unsafe:
+        return "unsafe read";
+    default:
+        return "none";
+    }
+}
+
 size_t DmaPusher::ProcessCommands(std::span<const CommandHeader> commands, size_t word_offset) {
     for (size_t index = 0; index < commands.size();) {
         // Data word of methods command
@@ -262,6 +362,10 @@ size_t DmaPusher::ProcessCommands(std::span<const CommandHeader> commands, size_
         } else {
             auto const command_header = commands[index]; //can copy
             // No command active - this is the first word of a new one
+            if (g_nx2_ampere && IsDesyncHeader(command_header) &&
+                OnDesyncHeader(commands, index, word_offset)) {
+                return commands.size();
+            }
             switch (command_header.mode) {
             case SubmissionMode::Increasing:
                 SetState(command_header);
@@ -614,7 +718,10 @@ void DmaPusher::CheckSubmitHash(const CommandListHeader& header, u64 submit_hash
 }
 
 void DmaPusher::RecordParsedEntry(const CommandListHeader& header,
-                                  std::span<const CommandHeader> commands) {
+                                  std::span<const CommandHeader> commands, EntryReadPath path) {
+    current_read_path = path;
+    current_words = commands.data();
+    current_word_count = commands.size();
     if (!g_record_parsed_entries) {
         return;
     }
@@ -622,7 +729,7 @@ void DmaPusher::RecordParsedEntry(const CommandListHeader& header,
     for (const CommandHeader& command : commands) {
         hash = (hash ^ command.argument) * 0x100000001b3ULL;
     }
-    parsed_entries[parsed_entry_count++ % parsed_entries.size()] = {header.addr, static_cast<u32>(header.size), hash};
+    parsed_entries[parsed_entry_count++ % parsed_entries.size()] = {header.addr, static_cast<u32>(header.size), hash, path};
 }
 
 void DmaPusher::DumpCurrentEntry(const char* reason) {
@@ -635,8 +742,9 @@ void DmaPusher::DumpCurrentEntry(const char* reason) {
         for (const u32 word : words) {
             hash = (hash ^ word) * 0x100000001b3ULL;
         }
-        LOG_WARNING(HW_GPU, "  parsed -{}: {:#x}+{:#x} {}", i, entry.address, entry.size,
-                    hash == entry.hash ? "unchanged" : "CHANGED since parsed");
+        LOG_WARNING(HW_GPU, "  parsed -{}: {:#x}+{:#x} {} ({})", i, entry.address, entry.size,
+                    hash == entry.hash ? "unchanged" : "CHANGED since parsed",
+                    ReadPathName(entry.path));
     }
     // EDEN_NX2_PB_DUMP=<file>: also write the whole command list (u64 address, u32 size and the
     // current words of every entry, then the current entry index) for offline replay.
@@ -660,9 +768,10 @@ void DmaPusher::DumpCurrentEntry(const char* reason) {
             std::fclose(file);
         }
     }
-    LOG_WARNING(HW_GPU, "pushbuffer dump ({}): method={:#x} sub={} count={} non_inc={} get={:#x}",
+    LOG_WARNING(HW_GPU,
+                "pushbuffer dump ({}): method={:#x} sub={} count={} non_inc={} get={:#x} read={}",
                 reason, dma_state.method, dma_state.subchannel, dma_state.method_count,
-                dma_state.non_incrementing, dma_state.dma_get);
+                dma_state.non_incrementing, dma_state.dma_get, ReadPathName(current_read_path));
     if (dma_pushbuffer.empty()) {
         return;
     }
@@ -670,8 +779,11 @@ void DmaPusher::DumpCurrentEntry(const char* reason) {
     const size_t first = dma_pushbuffer_subindex >= 2 ? dma_pushbuffer_subindex - 2 : 0;
     for (size_t i = first; i <= dma_pushbuffer_subindex && i < lists.size(); ++i) {
         const CommandListHeader& header = lists[i];
-        LOG_WARNING(HW_GPU, "  entry {} of {}: addr={:#x} size={:#x}", i, lists.size(),
-                    header.addr.Value(), header.size.Value());
+        LOG_WARNING(HW_GPU, "  entry {} of {}: addr={:#x} size={:#x}{}", i, lists.size(),
+                    header.addr.Value(), header.size.Value(),
+                    i == dma_pushbuffer_subindex
+                        ? fmt::format(" (current, read {})", ReadPathName(current_read_path))
+                        : std::string{});
         for (u64 word = 0; word < std::min<u64>(header.size, 0x80); word += 8) {
             std::string gpu_line;
             std::string cpu_line;
@@ -685,6 +797,22 @@ void DmaPusher::DumpCurrentEntry(const char* reason) {
             }
             LOG_WARNING(HW_GPU, "    +{:03x}:{}", word * 4, gpu_line);
             LOG_WARNING(HW_GPU, "    cpu :{}", cpu_line);
+            // The current entry's words as parsed, where they differ from memory now.
+            if (i == dma_pushbuffer_subindex && current_words != nullptr &&
+                current_word_count == header.size) {
+                std::string parsed_line;
+                bool differs = false;
+                for (u64 j = word; j < std::min<u64>(header.size, word + 8); ++j) {
+                    const u32 parsed = current_words[j].argument;
+                    const u32 gpu_value = memory_manager.Read<u32>(header.addr + j * sizeof(u32));
+                    differs |= parsed != gpu_value;
+                    parsed_line += parsed == gpu_value ? std::string(" ........")
+                                                       : fmt::format(" {:08x}", parsed);
+                }
+                if (differs) {
+                    LOG_WARNING(HW_GPU, "    read:{}", parsed_line);
+                }
+            }
         }
     }
 }

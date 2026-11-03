@@ -234,6 +234,11 @@ public:
     /// Fill image_view_ids with the graphics/compute images in indices
     void FillImageViews(std::span<ImageViewInOut> views, bool compute, bool blacklist = true);
 
+    /// EDEN_NX2_PASS_VALUES (round 19): logs value statistics of an image's level 0 now.
+    void Nx2LogImageValues(const char* tag, ImageId image_id);
+    /// Images a traced dispatch bound, logged before the next draw or dispatch.
+    std::vector<ImageId> nx2_dispatch_value_images;
+
     /// Handle feedback loops during draws.
     void CheckFeedbackLoop(std::span<const ImageViewInOut> views);
 

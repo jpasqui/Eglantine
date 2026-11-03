@@ -51,6 +51,7 @@
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 #include "video_core/nx2_pending_writes.h"
+#include "video_core/nx2_pb_trace.h"
 #include "video_core/nx2_vol_trace.h"
 #include "video_core/nx2_profile.h"
 
@@ -236,7 +237,8 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
       fence_manager(*this, gpu, texture_cache, buffer_cache, query_cache, device, scheduler),
       wfi_event(device.GetLogical().CreateEvent()) {
     scheduler.SetQueryCache(query_cache);
-    if (VideoCommon::Nx2VolTrace::RangeHistory() || VideoCommon::Nx2VolTrace::UploadSync()) {
+    if (VideoCommon::Nx2VolTrace::RangeHistory() || VideoCommon::Nx2VolTrace::UploadSync() ||
+        VideoCommon::Nx2VolTrace::StaleFrame() != 0) {
         VideoCommon::Nx2VolTrace::BufferGpuModifiedHook() = [this](u64 addr, u64 size) {
             return buffer_cache.IsRegionGpuModified(addr, static_cast<size_t>(size));
         };
@@ -494,6 +496,11 @@ void LogStaleDraw(const Tegra::Engines::Maxwell3D& maxwell3d, std::string_view k
 
 void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Draw};
+    if (VideoCommon::Nx2VolTrace::RangeHistory()) {
+        const auto& pipeline = maxwell3d->regs.pipelines[5];
+        VideoCommon::Nx2VolTrace::CurrentProgram().store(
+            (u64{pipeline.reserved[0] & 0xff} << 32) | pipeline.reserved[1], std::memory_order_relaxed);
+    }
     if (VideoCommon::Nx2VolTrace::StaleActive()) {
         LogStaleDraw(*maxwell3d, is_indexed ? "indexed" : "arrays",
                      is_indexed ? maxwell3d->draw_manager.draw_state.index_buffer.count
@@ -516,6 +523,46 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
                                  VideoCommon::Nx2VolTrace::StaleDraw().load(), stage_index, slot, buffer.address,
                                  i * 4, a, b);
                     }
+                }
+            }
+        }
+        // EDEN_NX2_STALE_CBUFS=<first>-<last>: large or non-finite floats in every bound constant buffer.
+        if (const auto [first, last] = VideoCommon::Nx2VolTrace::StaleCbufDraws();
+            first != 0 && VideoCommon::Nx2VolTrace::StaleDraw().load() >= first &&
+            VideoCommon::Nx2VolTrace::StaleDraw().load() <= last) {
+            const u32 draw = VideoCommon::Nx2VolTrace::StaleDraw().load();
+            for (const u32 stage_index : {0u, 4u}) {
+                const auto& stage = maxwell3d->state.shader_stages[stage_index];
+                for (u32 slot = 0; slot < Tegra::Engines::Maxwell3D::Regs::MaxConstBuffers; ++slot) {
+                    const auto& buffer = stage.const_buffers[slot];
+                    if (!buffer.enabled || buffer.size == 0) continue;
+                    std::vector<u32> words((std::min<u32>)(buffer.size, 0x10000) / 4);
+                    gpu_memory->ReadBlockUnsafe(buffer.address, words.data(), words.size() * 4);
+                    bool gpu_written = false;
+                    if (const auto cbuf_device = gpu_memory->GpuToCpuAddress(buffer.address)) {
+                        std::scoped_lock lock{buffer_cache.mutex};
+                        gpu_written = buffer_cache.IsRegionGpuModified(*cbuf_device, words.size() * 4);
+                    }
+                    u64 hash = 0xcbf29ce484222325ULL;
+                    std::string big;
+                    u32 big_count = 0, bad = 0;
+                    for (size_t i = 0; i < words.size(); ++i) {
+                        hash = (hash ^ words[i]) * 0x100000001b3ULL;
+                        float value;
+                        std::memcpy(&value, &words[i], sizeof(value));
+                        const u32 exponent = (words[i] >> 23) & 0xff;
+                        if (exponent == 0xff) {
+                            ++bad;
+                            if (big_count++ < 24) big += fmt::format(" +{:x}={:08x}", i * 4, words[i]);
+                        } else if (std::fabs(value) > 1000.0f && exponent < 0xa0) {
+                            // (exponent < 0xa0: skips handles and addresses read as floats > 2^33)
+                            if (big_count++ < 24) big += fmt::format(" +{:x}={}", i * 4, value);
+                        }
+                    }
+                    LOG_INFO(HW_GPU, "stale cbuf draw #{} stage {} slot {} at {:#x} size {:#x}{} hash {:016x}: "
+                             "{} non-finite, {} large/non-finite:{}",
+                             draw, stage_index, slot, buffer.address, buffer.size, gpu_written ? " G" : "",
+                             hash, bad, big_count, big);
                 }
             }
         }
@@ -1145,6 +1192,8 @@ void RasterizerVulkan::FlushRegion(DAddr addr, u64 size, VideoCommon::CacheType 
         });
     }
     const VideoCommon::Nx2PendingWrites::Scope pending_scope{pending.empty() ? nullptr : &pending};
+    VideoCommon::Nx2PbTrace::NoteEvent(gpu_written ? "FlushRegion (gpu-written)" : "FlushRegion",
+                                       addr, size);
     if (True(which & VideoCommon::CacheType::TextureCache)) {
         std::scoped_lock lock{texture_cache.mutex};
         texture_cache.DownloadMemory(addr, size);
@@ -1440,7 +1489,11 @@ void RasterizerVulkan::AccelerateInlineToMemory(GPUVAddr address, size_t copy_si
         gpu_memory->WriteBlock(address, memory.data(), copy_size);
         return;
     }
-    gpu_memory->WriteBlockUnsafe(address, memory.data(), copy_size);
+    {
+        const VideoCommon::Nx2PbTrace::WriteWatch watch{"inline upload", device_memory, *cpu_addr,
+                                                        copy_size};
+        gpu_memory->WriteBlockUnsafe(address, memory.data(), copy_size);
+    }
     // EDEN_NX2_INLINE_DEFER=0: invalidate every cache at once (for comparisons).
     static const bool defer = [] {
         const char* value = std::getenv("EDEN_NX2_INLINE_DEFER");

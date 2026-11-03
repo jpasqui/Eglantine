@@ -568,6 +568,10 @@ bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& 
                  qmd[12], qmd[13] & 0xffff, qmd[14] & 0xffff, qmd[18] >> 16, qmd[19] & 0xffff, qmd[19] >> 16,
                  (u64{qmd[33] & 0xff} << 32) | qmd[32]);
     }
+    if (VideoCommon::Nx2VolTrace::RangeHistory()) {
+        VideoCommon::Nx2VolTrace::CurrentProgram().store((u64{qmd[49] & 0x1ffff} << 32) | qmd[48],
+                                                         std::memory_order_relaxed);
+    }
     try {
         rasterizer->DispatchCompute();
     } catch (const Shader::Exception& error) {
