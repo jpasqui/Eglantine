@@ -560,7 +560,8 @@ jobs:
   release:
     name: Publish release
     needs: build
-    if: github.event_name == 'push' || inputs.publish_release
+    # Publishes whatever built: a platform with no free runner (macOS often, on forks) doesn't block the rest.
+    if: ${{ !cancelled() && (github.event_name == 'push' || inputs.publish_release) }}
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -636,6 +637,12 @@ jobs:
 
           The PGO builds are the same programs compiled with profile-guided optimization (clang plus Eden's profile); prefer them when your CPU supports it.
           EOF
+
+          if ! compgen -G "dist/eglantine-macos-*" > /dev/null; then
+            sed -i '/^## macOS$/,/^| arm64 /d' notes.md
+            echo "No macOS build this time: its job did not finish." >> notes.md
+          fi
+          test -n "$(ls dist)"
 
           gh release create "${tag}" dist/* \
             --repo "${GITHUB_REPOSITORY}" \
