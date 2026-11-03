@@ -222,6 +222,39 @@ struct GPU::Impl {
     }
 
     VideoCore::RasterizerDownloadArea OnCPURead(DAddr addr, u64 size) {
+        bool keep_faulting = false;
+        if (VideoCommon::Nx2VolTrace::SemWatchHit(addr)) {
+            u32 word = 0;
+            system.Host1x().MemoryManager().ReadBlockUnsafe(addr & ~DAddr{3}, &word, sizeof(word));
+            VideoCommon::Nx2VolTrace::RecordSem('r', addr, word);
+            keep_faulting = true;
+        }
+        if (VideoCommon::Nx2VolTrace::ReadbackWatched(addr, size)) {
+            std::array<u8, 16> bytes{};
+            system.Host1x().MemoryManager().ReadBlockUnsafe(addr, bytes.data(), bytes.size());
+            if (VideoCommon::Nx2VolTrace::ReadbackTrace()) {
+                LOG_INFO(HW_GPU, "CPU read of readback dst {:#x} size {:#x} present {}:{}; semaphore writes before:{}",
+                         addr, size, VideoCommon::Nx2VolTrace::PresentCount().load(std::memory_order_relaxed),
+                         VideoCommon::Nx2VolTrace::HexBytes(bytes.data(), bytes.size()),
+                         VideoCommon::Nx2VolTrace::SemRingText(48));
+            }
+            if (VideoCommon::Nx2VolTrace::ReadbackSync()) {
+                // Round 22 experiment: let the GPU thread finish what was submitted before this read.
+                const u64 fence = RequestSyncOperation([] {});
+                gpu_thread.TickGPU(is_async);
+                WaitForSyncOperation(fence);
+                if (VideoCommon::Nx2VolTrace::ReadbackTrace()) {
+                    std::array<u8, 16> after{};
+                    system.Host1x().MemoryManager().ReadBlockUnsafe(addr, after.data(), after.size());
+                    LOG_INFO(HW_GPU, "CPU read of readback dst {:#x} after GPU sync:{}", addr,
+                             VideoCommon::Nx2VolTrace::HexBytes(after.data(), after.size()));
+                }
+                keep_faulting = true;
+            }
+        }
+        if (keep_faulting) {
+            return VideoCore::RasterizerDownloadArea{.start_address = addr, .end_address = addr, .preemtive = true};
+        }
         auto raster_area = renderer->ReadRasterizer()->GetFlushArea(addr, size);
         if (raster_area.preemtive) {
             return raster_area;
@@ -230,7 +263,8 @@ struct GPU::Impl {
         // A guest CPU read of GPU-written memory (reactive flushing): count them, they decide
         // whether buffer data must be copied back at every fence (EDEN_NX2_BUFFER_DOWNLOADS).
         if (static std::atomic<u64> reads{}; (reads.fetch_add(1, std::memory_order_relaxed) & 63) == 0 ||
-                                              VideoCommon::Nx2VolTrace::StaleActive()) {
+                                              VideoCommon::Nx2VolTrace::StaleActive() ||
+                                              VideoCommon::Nx2VolTrace::ReadbackTrace()) {
             LOG_INFO(HW_GPU, "CPU read of GPU-written memory [{:#x}, {:#x}) ({} so far)",
                      raster_area.start_address, raster_area.end_address,
                      reads.load(std::memory_order_relaxed));

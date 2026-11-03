@@ -316,6 +316,9 @@ public:
 
     [[nodiscard]] ImageId DmaImageId(const Tegra::DMA::ImageOperand& operand, bool is_upload);
 
+    /// Round 22 (EDEN_NX2_READBACK_TRACE): read-protect and remember a readback destination.
+    void Nx2WatchReadback(GPUVAddr gpu_addr, size_t size);
+
     [[nodiscard]] std::pair<Image*, BufferImageCopy> DmaBufferImageCopy(
         const Tegra::DMA::ImageCopy& copy_info, const Tegra::DMA::BufferOperand& buffer_operand,
         const Tegra::DMA::ImageOperand& image_operand, ImageId image_id, bool modifies_image);

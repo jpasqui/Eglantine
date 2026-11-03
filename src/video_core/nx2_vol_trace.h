@@ -4,7 +4,10 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -405,6 +408,215 @@ inline const char* StaleSave() {
         return (value != nullptr && value[0] != '\0') ? value : nullptr;
     }();
     return dir;
+}
+
+/// EDEN_NX2_READBACK_TRACE=1: GPU->CPU readback paths (copy-engine block->pitch copies, DMA image lookups,
+/// async buffer downloads, small image downloads, CPU reads of GPU-written memory); false once 3000 lines are used.
+inline bool ReadbackTrace() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_READBACK_TRACE");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    if (!enabled) {
+        return false;
+    }
+    static std::atomic<u32> lines{};
+    return lines.fetch_add(1, std::memory_order_relaxed) < 3000;
+}
+
+inline bool ReadbackTraceOn() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_READBACK_TRACE");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    return enabled;
+}
+
+struct SemEvent {
+    u64 time_us;
+    u64 addr;
+    u32 value;
+    char kind;
+};
+
+inline u64 SteadyMicros() {
+    return static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch())
+                                .count());
+}
+
+inline std::mutex& SemRingMutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+inline std::array<SemEvent, 256>& SemRing() {
+    static std::array<SemEvent, 256> ring{};
+    return ring;
+}
+
+inline u64& SemRingCount() {
+    static u64 count{};
+    return count;
+}
+
+/// kind: 'f' fence release written, 'd' direct release, 'm' mirrored (either path).
+inline void RecordSem(char kind, u64 addr, u32 value) {
+    if (!ReadbackTraceOn()) {
+        return;
+    }
+    std::scoped_lock lock{SemRingMutex()};
+    SemRing()[SemRingCount()++ % 256] = SemEvent{SteadyMicros(), addr, value, kind};
+}
+
+inline std::string SemRingText(size_t last) {
+    std::scoped_lock lock{SemRingMutex()};
+    const u64 now = SteadyMicros();
+    const u64 count = SemRingCount();
+    const u64 first = count > last ? count - last : 0;
+    std::string text;
+    for (u64 i = first; i < count; ++i) {
+        const SemEvent& event = SemRing()[i % 256];
+        text += fmt::format(" {}{:#x}={:#x}@-{}", event.kind, event.addr, event.value, now - event.time_us);
+    }
+    return text;
+}
+
+/// EDEN_NX2_READBACK_SYNC=1: guest CPU reads of readback destination pages wait for the GPU thread first.
+inline bool ReadbackSync() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_READBACK_SYNC");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    return enabled;
+}
+
+/// EDEN_NX2_SEM_READ_WATCH=1: guest CPU reads of semaphore pages go into the semaphore ring.
+inline bool SemReadWatch() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_SEM_READ_WATCH");
+        return value != nullptr && value[0] != '\0' && value[0] != '0' && ReadbackTraceOn();
+    }();
+    return enabled;
+}
+
+inline std::vector<u64>& SemWatchPages() {
+    static std::vector<u64> pages;
+    return pages;
+}
+
+/// True when the page of `addr` was not watched yet (the caller read-protects it).
+inline bool SemWatchAdd(u64 addr) {
+    std::scoped_lock lock{SemRingMutex()};
+    auto& pages = SemWatchPages();
+    const u64 page = addr >> 12;
+    if (std::find(pages.begin(), pages.end(), page) != pages.end() || pages.size() >= 64) {
+        return false;
+    }
+    pages.push_back(page);
+    return true;
+}
+
+inline bool SemWatchHit(u64 addr) {
+    if (!SemReadWatch()) {
+        return false;
+    }
+    std::scoped_lock lock{SemRingMutex()};
+    const auto& pages = SemWatchPages();
+    return std::find(pages.begin(), pages.end(), addr >> 12) != pages.end();
+}
+
+/// Device pages of readback destinations (see EDEN_NX2_READBACK_TRACE), for the CPU read log.
+inline std::mutex& ReadbackWatchMutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+inline std::vector<u64>& ReadbackWatchPages() {
+    static std::vector<u64> pages;
+    return pages;
+}
+
+inline std::atomic<bool>& ReadbackWatchActive() {
+    static std::atomic<bool> active{};
+    return active;
+}
+
+/// Adds the pages of [addr, addr + size); returns the pages that were not watched yet.
+inline std::vector<u64> ReadbackWatchAdd(u64 addr, u64 size) {
+    std::vector<u64> added;
+    std::scoped_lock lock{ReadbackWatchMutex()};
+    auto& pages = ReadbackWatchPages();
+    for (u64 page = addr >> 12; page <= (addr + (std::max<u64>)(size, 1) - 1) >> 12; ++page) {
+        if (std::find(pages.begin(), pages.end(), page) == pages.end() && pages.size() < 256) {
+            pages.push_back(page);
+            added.push_back(page);
+        }
+    }
+    ReadbackWatchActive() = true;
+    return added;
+}
+
+inline bool ReadbackWatched(u64 addr, u64 size) {
+    if (!ReadbackWatchActive().load(std::memory_order_relaxed)) {
+        return false;
+    }
+    std::scoped_lock lock{ReadbackWatchMutex()};
+    for (const u64 page : ReadbackWatchPages()) {
+        if ((page << 12) < addr + size && addr < ((page + 1) << 12)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+inline std::string HexBytes(const u8* data, size_t size) {
+    std::string text;
+    for (size_t i = 0; i + 4 <= size && i < 64; i += 4) {
+        u32 word;
+        std::memcpy(&word, data + i, 4);
+        text += fmt::format(" {:08x}", word);
+    }
+    return text;
+}
+
+/// EDEN_NX2_INPUT_PRINT=<dir>: with the stale trace and EDEN_NX2_STALE_CBUFS, the contents (up to 64 KiB) of every
+/// buffer the scanned draws read, saved once per hash as <dir>/<hash>.bin; storage and texel buffers get an
+/// "input buffer" line at bind time (round 22).
+inline const char* InputPrint() {
+    static const char* const dir = [] {
+        const char* value = std::getenv("EDEN_NX2_INPUT_PRINT");
+        return (value != nullptr && value[0] != '\0' && value[0] != '0') ? value : nullptr;
+    }();
+    return dir;
+}
+
+inline u64 Fnv64(const void* data, size_t size) {
+    const u8* bytes = static_cast<const u8*>(data);
+    u64 hash = 0xcbf29ce484222325ULL;
+    for (size_t i = 0; i < size; ++i) {
+        hash = (hash ^ bytes[i]) * 0x100000001b3ULL;
+    }
+    return hash;
+}
+
+inline void SaveInputBlob(u64 hash, const void* data, size_t size) {
+    const char* const dir = InputPrint();
+    if (dir == nullptr || size == 0 || size > 0x10000) {
+        return;
+    }
+    static std::mutex mutex;
+    static std::vector<u64> saved;
+    std::scoped_lock lock{mutex};
+    if (std::find(saved.begin(), saved.end(), hash) != saved.end() || saved.size() >= 20000) {
+        return;
+    }
+    saved.push_back(hash);
+    const std::string path = fmt::format("{}/{:016x}.bin", dir, hash);
+    if (std::FILE* file = std::fopen(path.c_str(), "wb")) {
+        std::fwrite(data, 1, size, file);
+        std::fclose(file);
+    }
 }
 
 /// EDEN_NX2_STALE_VALUES: with the stale trace, value statistics of each sampled image at the end of the frame.

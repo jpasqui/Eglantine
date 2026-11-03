@@ -10,6 +10,8 @@
 #include <functional>
 #include <map>
 #include <mutex>
+#include <optional>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -119,12 +121,83 @@ inline void Nx2AddSemaphoreRegion(u64 start) {
 /// EDEN_NX2_SEM_MIRROR_MONOTONIC=0: mirror plainly.
 inline thread_local bool g_nx2_writing_mirror = false;
 
+/// Default of EDEN_NX2_SEM_MIRROR_SHADOW: on (round 22). Without it the guest CPU read mirrored progress values in
+/// a first-page word that also gets direct fence releases of another counter, so its waits could end before the
+/// GPU work ran (Pikmin 4's sky light SH readback: the lighting garbage of rounds 18-21).
+inline bool Nx2MirrorShadowDefault() {
+    return true;
+}
+
 inline bool Nx2MonotonicMirrorOn() {
     static const bool on = [] {
         const char* value = std::getenv("EDEN_NX2_SEM_MIRROR_MONOTONIC");
         return value == nullptr || value[0] != '0';
     }();
     return on;
+}
+
+/// EDEN_NX2_SEM_MIRROR_SHADOW (round 22): mirrored releases go to this table, not guest memory, so the guest
+/// CPU never reads a value the mirror made up; GPU acquires read the table first. Keyed by device word address.
+inline bool Nx2MirrorShadowOn() {
+    static const bool on = [] {
+        const char* value = std::getenv("EDEN_NX2_SEM_MIRROR_SHADOW");
+        return value == nullptr ? Nx2MirrorShadowDefault() : value[0] != '0';
+    }();
+    return on;
+}
+
+inline std::mutex& Nx2MirrorShadowMutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+struct Nx2MirrorShadowWord {
+    u32 value;  ///< the mirrored release
+    u32 guest;  ///< what guest memory held when it was written
+};
+
+inline std::unordered_map<u64, Nx2MirrorShadowWord>& Nx2MirrorShadowWords() {
+    static std::unordered_map<u64, Nx2MirrorShadowWord> words;
+    return words;
+}
+
+inline std::atomic<bool>& Nx2MirrorShadowUsed() {
+    static std::atomic<bool> used{};
+    return used;
+}
+
+/// The mirrored value of the word whose guest memory holds `guest` now, or none. A shadow whose guest word
+/// changed since (a CPU write, a direct release) is dropped: the guest value is the newer one.
+inline std::optional<u32> Nx2MirrorShadowGet(u64 device_address, u32 guest) {
+    if (!Nx2MirrorShadowUsed().load(std::memory_order_acquire)) {
+        return std::nullopt;
+    }
+    std::scoped_lock lock{Nx2MirrorShadowMutex()};
+    auto& words = Nx2MirrorShadowWords();
+    const auto it = words.find(device_address & ~u64{3});
+    if (it == words.end()) {
+        return std::nullopt;
+    }
+    if (it->second.guest != guest) {
+        words.erase(it);
+        return std::nullopt;
+    }
+    return it->second.value;
+}
+
+inline void Nx2MirrorShadowSet(u64 device_address, u32 value, u32 guest) {
+    std::scoped_lock lock{Nx2MirrorShadowMutex()};
+    Nx2MirrorShadowWords()[device_address & ~u64{3}] = Nx2MirrorShadowWord{value, guest};
+    Nx2MirrorShadowUsed().store(true, std::memory_order_release);
+}
+
+/// A direct release wrote the word: it holds the latest value again.
+inline void Nx2MirrorShadowClear(u64 device_address) {
+    if (!Nx2MirrorShadowUsed().load(std::memory_order_acquire)) {
+        return;
+    }
+    std::scoped_lock lock{Nx2MirrorShadowMutex()};
+    Nx2MirrorShadowWords().erase(device_address & ~u64{3});
 }
 
 /// True when a mirrored write of `value` over `current` would move the word backwards.

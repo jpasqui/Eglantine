@@ -1331,6 +1331,14 @@ void TextureCache<P>::DownloadMemory(DAddr cpu_addr, size_t size) {
         runtime.Finish();
         const Nx2PbTrace::WriteWatch watch{"image download (flush)", device_memory, image.cpu_addr,
                                            image.guest_size_bytes};
+        if (image.info.size.width <= 64 && image.info.size.height <= 64 && Nx2VolTrace::ReadbackTrace()) {
+            LOG_INFO(HW_GPU, "readback image flush id {} gpu {:#x} {}x{}x{} levels {} format {} present {}:{}",
+                     image_id.index, image.gpu_addr, image.info.size.width, image.info.size.height,
+                     image.info.size.depth, image.info.resources.levels, static_cast<u32>(image.info.format),
+                     Nx2VolTrace::PresentCount().load(),
+                     Nx2VolTrace::HexBytes(map.mapped_span.data(),
+                                           (std::min<size_t>)(map.mapped_span.size(), 64)));
+        }
         SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, map.mapped_span,
                      swizzle_data_buffer);
     }
@@ -1744,6 +1752,12 @@ void TextureCache<P>::PopAsyncFlushes() {
                 const Nx2PbTrace::WriteWatch watch{
                     "dma buffer download (async)", device_memory,
                     gpu_memory->GpuToCpuAddress(buffer_info.address).value_or(0), buffer_info.size};
+                if (Nx2VolTrace::ReadbackTrace()) {
+                    LOG_INFO(HW_GPU, "readback async buffer download {:#x} size {:#x} present {}:{}",
+                             buffer_info.address, buffer_info.size, Nx2VolTrace::PresentCount().load(),
+                             Nx2VolTrace::HexBytes(download_span.data(),
+                                                   (std::min<size_t>)(buffer_info.size, 64)));
+                }
                 gpu_memory->WriteBlockUnsafe(buffer_info.address, download_span.data(),
                                              buffer_info.size);
                 slot_buffer_downloads.erase(download_info.object_id);
@@ -1800,13 +1814,36 @@ void TextureCache<P>::PopAsyncFlushes() {
 }
 
 template <class P>
+void TextureCache<P>::Nx2WatchReadback(GPUVAddr gpu_addr, size_t size) {
+    const auto cpu = gpu_memory->GpuToCpuAddress(gpu_addr);
+    if (!cpu) {
+        return;
+    }
+    for (const u64 page : Nx2VolTrace::ReadbackWatchAdd(*cpu, size)) {
+        device_memory.UpdatePagesCachedCount(page << 12, 1ULL << 12, 1);
+        if (Nx2VolTrace::ReadbackTraceOn()) {
+            LOG_INFO(HW_GPU, "readback watch: device page {:#x} (gpu {:#x}) read-protected", page << 12, gpu_addr);
+        }
+    }
+}
+
+template <class P>
 ImageId TextureCache<P>::DmaImageId(const Tegra::DMA::ImageOperand& operand, bool is_upload) {
     const ImageInfo dst_info(operand);
     const ImageId dst_id = FindDMAImage(dst_info, operand.address);
     if (!dst_id) {
+        if (!is_upload && Nx2VolTrace::ReadbackTrace()) {
+            LOG_INFO(HW_GPU, "readback dma image {:#x}: no image", operand.address);
+        }
         return NULL_IMAGE_ID;
     }
     auto& image = slot_images[dst_id];
+    if (!is_upload && Nx2VolTrace::ReadbackTrace()) {
+        LOG_INFO(HW_GPU, "readback dma image {:#x}: id {} gpu {:#x} {}x{}x{} levels {} format {} flags {:#x} "
+                 "dma_downloaded {}", operand.address, dst_id.index, image.gpu_addr, image.info.size.width,
+                 image.info.size.height, image.info.size.depth, image.info.resources.levels,
+                 static_cast<u32>(image.info.format), static_cast<u32>(image.flags), image.info.dma_downloaded);
+    }
     if (False(image.flags & ImageFlagBits::GpuModified)) {
         // No need to waste time on an image that's synced with guest
         return NULL_IMAGE_ID;

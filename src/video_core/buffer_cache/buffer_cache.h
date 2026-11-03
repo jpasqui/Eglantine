@@ -107,7 +107,8 @@ void BufferCache<P>::RunGarbageCollector(bool aggressive_gc) {
 template <class P>
 void BufferCache<P>::Nx2NoteTracedBuffer(char kind, size_t stage, u32 slot, DAddr device_addr, u32 size,
                                          u32 format) {
-    if (VideoCommon::Nx2Sync::HostBuffers() == nullptr || nx2_traced_buffers_done ||
+    const bool print = VideoCommon::Nx2VolTrace::InputPrint() != nullptr;
+    if ((VideoCommon::Nx2Sync::HostBuffers() == nullptr && !print) || nx2_traced_buffers_done ||
         !VideoCommon::Nx2VolTrace::StaleActive().load(std::memory_order_relaxed) || device_addr == 0 ||
         size == 0 || nx2_traced_buffers.size() >= 20000) {
         return;
@@ -115,6 +116,19 @@ void BufferCache<P>::Nx2NoteTracedBuffer(char kind, size_t stage, u32 slot, DAdd
     const u32 draw = VideoCommon::Nx2VolTrace::StaleDraw().load(std::memory_order_relaxed);
     const auto [first, last] = VideoCommon::Nx2VolTrace::StaleCbufDraws();
     if (last != 0 && (draw < first || draw > last)) {
+        return;
+    }
+    if (print && kind != 'u' && last != 0) {
+        // Round 22: guest bytes at bind time (what an upload would give the host buffer now).
+        std::vector<u8> guest((std::min<u32>)(size, 4U << 20));
+        device_memory.ReadBlockUnsafe(device_addr, guest.data(), guest.size());
+        const u64 hash = VideoCommon::Nx2VolTrace::Fnv64(guest.data(), guest.size());
+        const bool gpu_written = IsRegionGpuModified(device_addr, size);
+        LOG_INFO(HW_GPU, "input buffer draw #{} {}{}:{} size {:#x} format {} device {:#x}{} hash {:016x}", draw, kind,
+                 stage, slot, size, format, device_addr, gpu_written ? " G" : "", hash);
+        VideoCommon::Nx2VolTrace::SaveInputBlob(hash, guest.data(), guest.size());
+    }
+    if (VideoCommon::Nx2Sync::HostBuffers() == nullptr) {
         return;
     }
     nx2_traced_buffers.push_back(Nx2TracedBuffer{kind, static_cast<u32>(stage), slot, draw, device_addr, size,
@@ -1190,6 +1204,34 @@ void BufferCache<P>::BindHostGraphicsUniformBuffers(size_t stage) {
 template <class P>
 void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 binding_index, bool needs_bind) {
     ++channel_state->uniform_cache_shots[0];
+    if (VideoCommon::Nx2VolTrace::InputPrint() != nullptr &&
+        VideoCommon::Nx2VolTrace::StaleActive().load(std::memory_order_relaxed)) {
+        const u32 draw = VideoCommon::Nx2VolTrace::StaleDraw().load(std::memory_order_relaxed);
+        const auto [first, last] = VideoCommon::Nx2VolTrace::StaleCbufDraws();
+        if (last != 0 && draw >= first && draw <= last) {
+            const u32 used = (*channel_state->uniform_buffer_sizes)[stage][index];
+            if (index == 17 && maxwell3d->root_tables.loaded && channel_state->uniform_buffers[stage][index].size == 0) {
+                const auto& words = maxwell3d->root_tables.tables[0];
+                const u32 copied = (std::min)(used, static_cast<u32>(sizeof(words)));
+                const u64 hash = VideoCommon::Nx2VolTrace::Fnv64(words.data(), copied);
+                LOG_INFO(HW_GPU, "input cbuf used draw #{} stage {} slot {} root size {:#x} hash {:016x}", draw,
+                         stage, index, copied, hash);
+                VideoCommon::Nx2VolTrace::SaveInputBlob(hash, words.data(), copied);
+            } else {
+                const Binding& use = channel_state->uniform_buffers[stage][index];
+                const u32 size = (std::min)(use.size, used);
+                std::vector<u8> guest(size);
+                if (use.device_addr != 0 && size != 0) {
+                    device_memory.ReadBlockUnsafe(use.device_addr, guest.data(), size);
+                }
+                const u64 hash = VideoCommon::Nx2VolTrace::Fnv64(guest.data(), guest.size());
+                const bool gpu_written = use.device_addr != 0 && size != 0 && IsRegionGpuModified(use.device_addr, size);
+                LOG_INFO(HW_GPU, "input cbuf used draw #{} stage {} slot {} size {:#x} of {:#x} device {:#x}{} hash {:016x}",
+                         draw, stage, index, size, use.size, use.device_addr, gpu_written ? " G" : "", hash);
+                VideoCommon::Nx2VolTrace::SaveInputBlob(hash, guest.data(), guest.size());
+            }
+        }
+    }
     // Bank 24 (root table 0, NVN2's push constants) is read from bank 17, which such games do not
     // bind: stream the table's current words as that buffer.
     if (index == 17 && maxwell3d->root_tables.loaded && channel_state->uniform_buffers[stage][index].size == 0) {

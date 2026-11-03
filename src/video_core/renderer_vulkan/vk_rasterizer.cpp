@@ -564,6 +564,7 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
                              "{} non-finite, {} large/non-finite:{}",
                              draw, stage_index, slot, buffer.address, buffer.size, gpu_written ? " G" : "",
                              hash, bad, big_count, big);
+                    VideoCommon::Nx2VolTrace::SaveInputBlob(hash, words.data(), words.size() * 4);
                 }
             }
         }
@@ -1677,6 +1678,11 @@ bool AccelerateDMA::DmaBufferImageCopy(const Tegra::DMA::ImageCopy& copy_info,
                                        const Tegra::DMA::BufferOperand& buffer_operand,
                                        const Tegra::DMA::ImageOperand& image_operand) {
     std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
+    if (!IS_IMAGE_UPLOAD &&
+        (VideoCommon::Nx2VolTrace::ReadbackSync() || VideoCommon::Nx2VolTrace::ReadbackTrace())) {
+        texture_cache.Nx2WatchReadback(buffer_operand.address,
+                                       static_cast<size_t>(buffer_operand.pitch) * buffer_operand.height);
+    }
     const auto image_id = texture_cache.DmaImageId(image_operand, IS_IMAGE_UPLOAD);
     if (image_id == VideoCommon::NULL_IMAGE_ID) {
         return false;

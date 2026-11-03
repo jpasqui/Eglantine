@@ -22,6 +22,7 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/gpu.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
+#include "video_core/nx2_vol_trace.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
 #include "video_core/query_cache/bank_base.h"
@@ -297,9 +298,14 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
         }
         query_base->value += streamer->GetAmendValue();
         streamer->SetAccumulationValue(query_base->value);
+        u32 guest_word = 0;
         if (monotonic) {
             u32 current;
             std::memcpy(&current, pointer, sizeof(current));
+            guest_word = current;
+            if (Tegra::Nx2MirrorShadowOn()) {
+                current = Tegra::Nx2MirrorShadowGet(cpu_addr, current).value_or(current);
+            }
             if (Tegra::Nx2MirrorWouldLower(current, static_cast<u32>(query_base->value))) {
                 if (static std::atomic<u32> skipped{}; skipped.fetch_add(1) < 8) {
                     LOG_INFO(HW_GPU, "Mirrored semaphore release {:#x}={:#x} skipped: the word holds {:#x}",
@@ -311,6 +317,16 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
                 return;
             }
         }
+        if (monotonic && Tegra::Nx2MirrorShadowOn()) {
+            // Round 22: GPU acquires see the mirrored value, guest memory (the CPU) does not.
+            Tegra::Nx2MirrorShadowSet(cpu_addr, static_cast<u32>(query_base->value), guest_word);
+            VideoCommon::Nx2VolTrace::RecordSem('s', cpu_addr, static_cast<u32>(query_base->value));
+            Tegra::Nx2SemaphoreWaiters::Get().OnWrite(cpu_addr, static_cast<u32>(query_base->value));
+            if (!is_synced) [[likely]] {
+                impl->pending_unregister.push_back(query_location);
+            }
+            return;
+        }
         if (True(query_base->flags & QueryFlagBits::HasTimestamp)) {
             u64 timestamp = impl->gpu.GetTicks();
             std::memcpy(pointer_timestamp, &timestamp, sizeof(timestamp));
@@ -318,6 +334,13 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
         } else {
             u32 value = static_cast<u32>(query_base->value);
             std::memcpy(pointer, &value, sizeof(value));
+        }
+        if (!monotonic && Tegra::Nx2MirrorShadowOn()) {
+            Tegra::Nx2MirrorShadowClear(cpu_addr);
+        }
+        VideoCommon::Nx2VolTrace::RecordSem(monotonic ? 'm' : 'f', cpu_addr, static_cast<u32>(query_base->value));
+        if (VideoCommon::Nx2VolTrace::SemReadWatch() && VideoCommon::Nx2VolTrace::SemWatchAdd(cpu_addr)) {
+            impl->device_memory.UpdatePagesCachedCount(cpu_addr & ~DAddr{0xfff}, 0x1000, 1);
         }
         Tegra::Nx2SemaphoreWaiters::Get().OnWrite(cpu_addr, static_cast<u32>(query_base->value));
         if (!is_synced) [[likely]] {
@@ -331,10 +354,22 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
             if (monotonic) {
                 u32 current;
                 std::memcpy(&current, pointer, sizeof(current));
+                const u32 guest_word = current;
+                if (Tegra::Nx2MirrorShadowOn()) {
+                    current = Tegra::Nx2MirrorShadowGet(cpu_addr, current).value_or(current);
+                }
                 if (Tegra::Nx2MirrorWouldLower(current, payload)) {
                     streamer->Free(new_query_id);
                     return;
                 }
+                if (Tegra::Nx2MirrorShadowOn()) {
+                    Tegra::Nx2MirrorShadowSet(cpu_addr, payload, guest_word);
+                    Tegra::Nx2SemaphoreWaiters::Get().OnWrite(cpu_addr, payload);
+                    streamer->Free(new_query_id);
+                    return;
+                }
+            } else if (Tegra::Nx2MirrorShadowOn()) {
+                Tegra::Nx2MirrorShadowClear(cpu_addr);
             }
             if (has_timestamp) {
                 u64 timestamp = impl->gpu.GetTicks();
@@ -344,6 +379,7 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
             } else {
                 std::memcpy(pointer, &payload, sizeof(payload));
             }
+            VideoCommon::Nx2VolTrace::RecordSem(monotonic ? 'm' : 'd', cpu_addr, payload);
             Tegra::Nx2SemaphoreWaiters::Get().OnWrite(cpu_addr, payload);
             streamer->Free(new_query_id);
             return;

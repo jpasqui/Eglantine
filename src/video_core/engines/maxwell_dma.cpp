@@ -290,7 +290,29 @@ void MaxwellDMA::CopyBlockLinearToPitch() {
     copy_info.length_x = regs.line_length_in;
     copy_info.length_y = regs.line_count;
     auto& accelerate = rasterizer->AccessAccelerateDMA();
+    const bool readback_trace = VideoCommon::Nx2VolTrace::ReadbackTrace();
+    if (readback_trace) {
+        LOG_INFO(HW_GPU,
+                 "readback dma present {} block->pitch {:#x} -> {:#x} src {}x{}x{} layer {} origin {},{} block "
+                 "{}x{}x{} dst pitch {} length {} lines {} remap {} comp {}x{}",
+                 VideoCommon::Nx2VolTrace::PresentCount().load(std::memory_order_relaxed),
+                 static_cast<u64>(regs.offset_in), static_cast<u64>(regs.offset_out), regs.src_params.width,
+                 regs.src_params.height, regs.src_params.depth, regs.src_params.layer,
+                 regs.src_params.origin.x.Value(), regs.src_params.origin.y.Value(),
+                 regs.src_params.block_size.width.Value(), regs.src_params.block_size.height.Value(),
+                 regs.src_params.block_size.depth.Value(), regs.pitch_out, regs.line_length_in, regs.line_count,
+                 regs.launch_dma.remap_enable.Value(), regs.remap_const.num_dst_components_minus_one + 1,
+                 regs.remap_const.component_size_minus_one + 1);
+        LOG_INFO(HW_GPU, "readback dma semaphore type {} at {:#x} payload {:#x}; semaphore writes before:{}",
+                 static_cast<u32>(regs.launch_dma.semaphore_type.Value()),
+                 static_cast<GPUVAddr>(regs.semaphore.address), regs.semaphore.payload,
+                 VideoCommon::Nx2VolTrace::SemRingText(48));
+    }
     if (accelerate.ImageToBuffer(copy_info, src_operand, dst_operand)) {
+        if (readback_trace) {
+            LOG_INFO(HW_GPU, "readback dma {:#x}: texture cache copy (async download)",
+                     static_cast<u64>(regs.offset_out));
+        }
         return;
     }
 
@@ -339,6 +361,11 @@ void MaxwellDMA::CopyBlockLinearToPitch() {
     UnswizzleSubrect(tmp_write_buffer, tmp_read_buffer, bytes_per_pixel, width, height, depth,
                      x_offset, src_params.origin.y, x_elements, regs.line_count, block_height,
                      block_depth, dst_operand.pitch, memory_manager.UsesNativeTiling());
+    if (readback_trace) {
+        LOG_INFO(HW_GPU, "readback dma {:#x}: software unswizzle bpp {} src size {:#x} dst size {:#x}:{}",
+                 static_cast<u64>(regs.offset_out), bytes_per_pixel, src_size, dst_size,
+                 VideoCommon::Nx2VolTrace::HexBytes(tmp_write_buffer.data(), (std::min<size_t>)(dst_size, 64)));
+    }
 }
 
 void MaxwellDMA::CopyPitchToBlockLinear() {
