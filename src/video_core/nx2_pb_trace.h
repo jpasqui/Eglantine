@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -35,6 +36,12 @@ void NoteEvent(const char* source, u64 device_addr, u64 size);
 /// Logs the recorded writes, events and submits that overlap [device_addr, device_addr + size).
 void ReportOverlapping(u64 device_addr, u64 size);
 
+/// EDEN_NX2_DOWNLOAD_WATCH=1: every watched write that changed guest bytes, anywhere (ring of 16384).
+bool DownloadWatch();
+void NoteChangedWrite(const char* source, u64 device_addr, u64 size, u64 changed, u64 first_changed);
+/// The kept writes that overlap [device_addr, device_addr + size), one per line, oldest first.
+std::string ChangedWritesOverlapping(u64 device_addr, u64 size);
+
 /// Snapshots the command-page bytes of a write's range on construction and records the granules
 /// it changed on destruction. Memory: anything with ReadBlockUnsafe(device address, dest, size).
 template <typename Memory>
@@ -42,6 +49,10 @@ class WriteWatch {
 public:
     WriteWatch(const char* source_, Memory& memory_, u64 device_addr_, u64 size_)
         : source{source_}, memory{memory_}, device_addr{device_addr_}, size{size_} {
+        if (DownloadWatch() && size != 0 && size <= (64ULL << 20)) {
+            whole_before.resize(static_cast<size_t>(size));
+            memory.ReadBlockUnsafe(device_addr, whole_before.data(), static_cast<size_t>(size));
+        }
         if (!Enabled() || size == 0) {
             return;
         }
@@ -49,6 +60,20 @@ public:
         Read(before);
     }
     ~WriteWatch() {
+        if (!whole_before.empty()) {
+            std::vector<u8> whole_after(whole_before.size());
+            memory.ReadBlockUnsafe(device_addr, whole_after.data(), whole_after.size());
+            u64 changed = 0;
+            u64 first_changed = ~0ULL;
+            for (size_t i = 0; i < whole_after.size(); ++i) {
+                if (whole_after[i] != whole_before[i]) {
+                    if (changed++ == 0) first_changed = i;
+                }
+            }
+            if (changed != 0) {
+                NoteChangedWrite(source, device_addr, size, changed, first_changed);
+            }
+        }
         if (pieces.empty()) {
             return;
         }
@@ -79,6 +104,7 @@ private:
     u64 size;
     std::vector<std::pair<u64, u64>> pieces;
     std::vector<u8> before;
+    std::vector<u8> whole_before;
 };
 
 } // namespace VideoCommon::Nx2PbTrace

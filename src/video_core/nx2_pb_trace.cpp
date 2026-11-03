@@ -12,9 +12,63 @@
 #include <fmt/format.h>
 
 #include "common/logging.h"
+#include <chrono>
 #include "video_core/nx2_pb_trace.h"
 
 namespace VideoCommon::Nx2PbTrace {
+
+namespace {
+struct ChangedWrite {
+    const char* source;
+    u64 device_addr;
+    u64 size;
+    u64 changed;
+    u64 first_changed;
+    std::chrono::steady_clock::time_point when;
+};
+std::mutex changed_mutex;
+std::vector<ChangedWrite> changed_ring;
+size_t changed_next = 0;
+const std::chrono::steady_clock::time_point changed_epoch = std::chrono::steady_clock::now();
+} // Anonymous namespace
+
+bool DownloadWatch() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_DOWNLOAD_WATCH");
+        return value != nullptr && value[0] != '0';
+    }();
+    return enabled;
+}
+
+void NoteChangedWrite(const char* source, u64 device_addr, u64 size, u64 changed, u64 first_changed) {
+    std::scoped_lock lock{changed_mutex};
+    constexpr size_t RingSize = 16384;
+    const ChangedWrite write{source, device_addr, size, changed, first_changed, std::chrono::steady_clock::now()};
+    if (changed_ring.size() < RingSize) {
+        changed_ring.push_back(write);
+    } else {
+        changed_ring[changed_next] = write;
+        changed_next = (changed_next + 1) % RingSize;
+    }
+}
+
+std::string ChangedWritesOverlapping(u64 device_addr, u64 size) {
+    std::scoped_lock lock{changed_mutex};
+    std::string text;
+    u32 shown = 0;
+    const size_t count = changed_ring.size();
+    for (size_t i = 0; i < count && shown < 24; ++i) {
+        const ChangedWrite& write = changed_ring[(changed_next + i) % count];
+        if (write.device_addr < device_addr + size && device_addr < write.device_addr + write.size) {
+            ++shown;
+            text += fmt::format("\n    at {:.3f} s {} {:#x}+{:#x} changed {} bytes from +{:#x}",
+                                std::chrono::duration<double>(write.when - changed_epoch).count(), write.source,
+                                write.device_addr, write.size, write.changed, write.first_changed);
+        }
+    }
+    return text.empty() ? std::string{" none"} : text;
+}
+
 namespace {
 
 constexpr u64 PageBits = 12;

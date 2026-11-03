@@ -493,6 +493,79 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         texture_cache.FillImageViews(std::span(views.data(), views.size()), false,
                                      Spec::has_images);
     }
+    if (static const bool desc_check = [] {
+            const char* value = std::getenv("EDEN_NX2_DESC_CHECK");
+            return value != nullptr && value[0] != '0';
+        }();
+        desc_check) {
+        // What each bound view is, against what the pipeline was compiled for (same order as the views above).
+        static std::set<std::tuple<const void*, size_t, u32, u32, u32>> reported;
+        static u32 logged{};
+        const auto view_type_of = [](Shader::TextureType type) {
+            using VT = VideoCommon::ImageViewType;
+            switch (type) {
+            case Shader::TextureType::Color1D: return VT::e1D;
+            case Shader::TextureType::ColorArray1D: return VT::e1DArray;
+            case Shader::TextureType::Color2D: return VT::e2D;
+            case Shader::TextureType::ColorArray2D: return VT::e2DArray;
+            case Shader::TextureType::Color3D: return VT::e3D;
+            case Shader::TextureType::ColorCube: return VT::Cube;
+            case Shader::TextureType::ColorArrayCube: return VT::CubeArray;
+            case Shader::TextureType::Buffer: return VT::Buffer;
+            case Shader::TextureType::Color2DRect: return VT::Rect;
+            }
+            return VT::e2D;
+        };
+        size_t view_index = 0;
+        for (size_t stage = 0; stage < stage_infos.size(); ++stage) {
+            // Disabled stages have empty infos and pushed no views.
+            const Shader::Info& info{stage_infos[stage]};
+            view_index += Shader::NumDescriptors(info.texture_buffer_descriptors);
+            view_index += Shader::NumDescriptors(info.image_buffer_descriptors);
+            u32 desc_index = 0;
+            const auto check = [&](Shader::TextureType type, bool is_integer, bool is_image, u32 handle_program,
+                                   u32 count) {
+                for (u32 i = 0; i < count; ++i, ++view_index) {
+                    if (view_index >= views.size() || views[view_index].id == VideoCommon::NULL_IMAGE_VIEW_ID) {
+                        continue;
+                    }
+                    const ImageView& view = texture_cache.GetImageView(views[view_index].id);
+                    const bool view_integer = VideoCore::Surface::IsPixelFormatInteger(view.format);
+                    const auto wanted = view_type_of(type);
+                    const bool type_ok = wanted == view.type ||
+                                         (wanted == VideoCommon::ImageViewType::e2D &&
+                                          view.type == VideoCommon::ImageViewType::e2DArray) ||
+                                         (wanted == VideoCommon::ImageViewType::e2DArray &&
+                                          view.type == VideoCommon::ImageViewType::e2D);
+                    if (type_ok && view_integer == is_integer) {
+                        continue;
+                    }
+                    if (logged < 300 &&
+                        reported.insert({this, stage, desc_index, static_cast<u32>(view.format),
+                                         static_cast<u32>(view.type)}).second) {
+                        ++logged;
+                        LOG_WARNING(Render_Vulkan,
+                                    "desc check: pipeline {} stage {} {} {} compiled as type {} {} binds handle {:#x} "
+                                    "image {:#x} {}x{}x{} format {} view type {}{} (draw {})",
+                                    static_cast<const void*>(this), stage, is_image ? "image" : "texture",
+                                    desc_index, static_cast<u32>(type), is_integer ? "integer" : "float",
+                                    views[view_index].index, view.gpu_addr, view.size.width, view.size.height,
+                                    view.size.depth, static_cast<u32>(view.format), static_cast<u32>(view.type),
+                                    handle_program != ~0U ? fmt::format(", handle program {}", handle_program)
+                                                          : std::string{},
+                                    VideoCommon::Nx2VolTrace::StaleDraw().load(std::memory_order_relaxed));
+                    }
+                }
+                ++desc_index;
+            };
+            for (const auto& desc : info.texture_descriptors) {
+                check(desc.type, desc.is_integer, false, desc.handle_program, desc.count);
+            }
+            for (const auto& desc : info.image_descriptors) {
+                check(desc.type, desc.is_integer, true, desc.handle_program, desc.count);
+            }
+        }
+    }
     if (VideoCommon::Nx2VolTrace::Enabled()) {
         // The 3D images draws sample, each image once (and again when a handle maps elsewhere).
         static std::set<std::tuple<u32, GPUVAddr, u32>> seen;

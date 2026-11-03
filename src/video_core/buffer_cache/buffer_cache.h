@@ -7,6 +7,7 @@
 #pragma once
 
 #include <algorithm>
+#include <map>
 #include <memory>
 #include <numeric>
 #include <stdexcept>
@@ -24,6 +25,7 @@
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/nx2_sync.h"
 #include "video_core/texture_cache/util.h"
 
 namespace VideoCommon {
@@ -103,10 +105,102 @@ void BufferCache<P>::RunGarbageCollector(bool aggressive_gc) {
 }
 
 template <class P>
+void BufferCache<P>::Nx2NoteTracedBuffer(char kind, size_t stage, u32 slot, DAddr device_addr, u32 size,
+                                         u32 format) {
+    if (VideoCommon::Nx2Sync::HostBuffers() == nullptr || nx2_traced_buffers_done ||
+        !VideoCommon::Nx2VolTrace::StaleActive().load(std::memory_order_relaxed) || device_addr == 0 ||
+        size == 0 || nx2_traced_buffers.size() >= 20000) {
+        return;
+    }
+    const u32 draw = VideoCommon::Nx2VolTrace::StaleDraw().load(std::memory_order_relaxed);
+    const auto [first, last] = VideoCommon::Nx2VolTrace::StaleCbufDraws();
+    if (last != 0 && (draw < first || draw > last)) {
+        return;
+    }
+    nx2_traced_buffers.push_back(Nx2TracedBuffer{kind, static_cast<u32>(stage), slot, draw, device_addr, size,
+                                                 format});
+}
+
+template <class P>
+void BufferCache<P>::Nx2DumpTracedBuffers() {
+    nx2_traced_buffers_done = true;
+    const char* const dir = VideoCommon::Nx2Sync::HostBuffers();
+    const bool save = dir != nullptr && !(dir[0] == '1' && dir[1] == '\0');
+    std::map<std::pair<DAddr, u32>, std::string> users;
+    for (const Nx2TracedBuffer& use : nx2_traced_buffers) {
+        std::string& text = users[{use.device_addr, use.size}];
+        if (text.size() < 600) {
+            text += fmt::format(" {}{}:{}#{}/f{}", use.kind, use.stage, use.slot, use.draw, use.format);
+        }
+    }
+    u32 logged = 0;
+    for (const auto& [range, who] : users) {
+        const auto [device_addr, size] = range;
+        if (logged++ >= 400) {
+            break;
+        }
+        if (!IsRegionRegistered(device_addr, size)) {
+            LOG_INFO(HW_GPU, "host buffer {:#x} size {:#x}: not registered, users{}", device_addr, size, who);
+            continue;
+        }
+        const bool gpu_written = IsRegionGpuModified(device_addr, size);
+        std::vector<u8> bytes(size);
+        if constexpr (USE_MEMORY_MAPS) {
+            const BufferId buffer_id = FindBuffer(device_addr, size, false);
+            Buffer& buffer = slot_buffers[buffer_id];
+            auto staging = runtime.DownloadStagingBuffer(size);
+            std::array<BufferCopy, 1> copies{BufferCopy{
+                .src_offset = buffer.Offset(device_addr),
+                .dst_offset = staging.offset,
+                .size = size,
+            }};
+            runtime.CopyBuffer(staging.buffer, buffer, copies, true);
+            runtime.Finish();
+            std::memcpy(bytes.data(), staging.mapped_span.data(), size);
+        } else {
+            continue;
+        }
+        std::vector<u8> guest(size);
+        device_memory.ReadBlockUnsafe(device_addr, guest.data(), size);
+        u64 hash = 0xcbf29ce484222325ULL;
+        u64 nonzero = 0;
+        for (const u8 byte : bytes) {
+            hash = (hash ^ byte) * 0x100000001b3ULL;
+            nonzero += byte != 0;
+        }
+        u64 differs = 0;
+        for (size_t i = 0; i < size; ++i) {
+            differs += bytes[i] != guest[i];
+        }
+        std::string words;
+        for (size_t i = 0; i + 4 <= size && i < 64; i += 4) {
+            u32 word;
+            std::memcpy(&word, bytes.data() + i, 4);
+            words += fmt::format(" {:08x}", word);
+        }
+        LOG_INFO(HW_GPU, "host buffer {:#x} size {:#x}{} hash {:016x} nonzero bytes {} guest-differs {} users{} "
+                 "words{}", device_addr, size, gpu_written ? " G" : "", hash, nonzero, differs, who, words);
+        if (save && size <= (4U << 20)) {
+            const std::string path = fmt::format("{}/buf-{:x}-{:x}.bin", dir, device_addr, size);
+            if (std::FILE* file = std::fopen(path.c_str(), "wb")) {
+                std::fwrite(bytes.data(), 1, size, file);
+                std::fclose(file);
+            }
+        }
+    }
+    LOG_INFO(HW_GPU, "host buffers: {} uses, {} ranges", nx2_traced_buffers.size(), users.size());
+    nx2_traced_buffers.clear();
+}
+
+template <class P>
 void BufferCache<P>::TickFrame() {
     // Homebrew console apps don't create or bind any channels, so this will be nullptr.
     if (!channel_state) {
         return;
+    }
+    if (!nx2_traced_buffers.empty() && !nx2_traced_buffers_done &&
+        !VideoCommon::Nx2VolTrace::StaleActive().load(std::memory_order_relaxed)) {
+        Nx2DumpTracedBuffers();
     }
     runtime.TickFrame(slot_buffers);
     if (frame_tick % 600 == 0 && !uploaded_buffer_ranges.empty()) {
@@ -1119,6 +1213,7 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
     const Binding& binding = channel_state->uniform_buffers[stage][index];
     const DAddr device_addr = binding.device_addr;
     const u32 size = (std::min)(binding.size, (*channel_state->uniform_buffer_sizes)[stage][index]);
+    Nx2NoteTracedBuffer('u', stage, index, device_addr, size, 0);
     Buffer& buffer = slot_buffers[binding.buffer_id];
     TouchBuffer(buffer, binding.buffer_id);
     const bool has_host_buffer = binding.buffer_id != NULL_BUFFER_ID;
@@ -1280,6 +1375,7 @@ void BufferCache<P>::BindHostGraphicsStorageBuffers(size_t stage) {
     ForEachEnabledBit(channel_state->enabled_storage_buffers[stage], [&](u32 index) {
         const Binding& binding = channel_state->storage_buffers[stage][index];
         const bool is_written = ((channel_state->written_storage_buffers[stage] >> index) & 1) != 0;
+        Nx2NoteTracedBuffer(is_written ? 'w' : 's', stage, index, binding.device_addr, binding.size, 0);
         if (BindMultiRangeStorage(binding, is_written, graphics_segments)) {
             return;
         }
@@ -1308,6 +1404,7 @@ template <class P>
 void BufferCache<P>::BindHostGraphicsTextureBuffers(size_t stage) {
     ForEachEnabledBit(channel_state->enabled_texture_buffers[stage], [&](u32 index) {
         const TextureBufferBinding& binding = channel_state->texture_buffers[stage][index];
+        Nx2NoteTracedBuffer('t', stage, index, binding.device_addr, binding.size, static_cast<u32>(binding.format));
         Buffer& buffer = slot_buffers[binding.buffer_id];
         const u32 size = binding.size;
         SynchronizeBuffer(buffer, binding.device_addr, size);
@@ -1427,6 +1524,7 @@ void BufferCache<P>::BindHostComputeStorageBuffers() {
         const Binding& binding = channel_state->compute_storage_buffers[index];
         const bool is_written =
             ((channel_state->written_compute_storage_buffers >> index) & 1) != 0;
+        Nx2NoteTracedBuffer(is_written ? 'W' : 'S', 5, index, binding.device_addr, binding.size, 0);
         if (BindMultiRangeStorage(binding, is_written, compute_segments)) {
             return;
         }
@@ -1455,6 +1553,7 @@ template <class P>
 void BufferCache<P>::BindHostComputeTextureBuffers() {
     ForEachEnabledBit(channel_state->enabled_compute_texture_buffers, [&](u32 index) {
         const TextureBufferBinding& binding = channel_state->compute_texture_buffers[index];
+        Nx2NoteTracedBuffer('T', 5, index, binding.device_addr, binding.size, static_cast<u32>(binding.format));
         Buffer& buffer = slot_buffers[binding.buffer_id];
         const u32 size = binding.size;
         SynchronizeBuffer(buffer, binding.device_addr, size);

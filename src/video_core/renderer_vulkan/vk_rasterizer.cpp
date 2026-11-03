@@ -54,6 +54,7 @@
 #include "video_core/nx2_pb_trace.h"
 #include "video_core/nx2_vol_trace.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/nx2_sync.h"
 
 namespace Vulkan {
 
@@ -1039,6 +1040,34 @@ void RasterizerVulkan::Clear(u32 layer_count) {
     }
 }
 
+namespace {
+// EDEN_NX2_SYNC experiments: every earlier write made visible to every later access, all stages.
+void Nx2FullBarrier(Scheduler& scheduler) {
+    static constexpr VkMemoryBarrier FULL_BARRIER{
+        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .pNext = nullptr,
+        .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+    };
+    scheduler.RequestOutsideRenderPassOperationContext();
+    scheduler.Record([](vk::CommandBuffer cmdbuf) {
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0,
+                               FULL_BARRIER);
+    });
+}
+
+void Nx2AfterDispatch(Scheduler& scheduler) {
+    static const bool barrier_after = VideoCommon::Nx2Sync::Has('c');
+    static const bool finish_after = VideoCommon::Nx2Sync::Has('f');
+    if (barrier_after) {
+        Nx2FullBarrier(scheduler);
+    }
+    if (finish_after) {
+        scheduler.Finish();
+    }
+}
+} // namespace
+
 void RasterizerVulkan::DispatchCompute() {
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Compute};
     FlushWork();
@@ -1070,6 +1099,9 @@ void RasterizerVulkan::DispatchCompute() {
         const auto [buffer, offset] =
             buffer_cache.ObtainBuffer(*indirect_address, 12, sync_info, post_op);
         scheduler.RequestOutsideRenderPassOperationContext();
+        if (static const bool full_before = VideoCommon::Nx2Sync::Has('b'); full_before) {
+            Nx2FullBarrier(scheduler);
+        }
         scheduler.Record([pipeline, indirect_buffer = buffer->Handle(),
                           indirect_offset = offset](vk::CommandBuffer cmdbuf) {
             if (!pipeline->IsBound()) {
@@ -1077,6 +1109,7 @@ void RasterizerVulkan::DispatchCompute() {
             }
             cmdbuf.DispatchIndirect(indirect_buffer, indirect_offset);
         });
+        Nx2AfterDispatch(scheduler);
         SubmitNx2ListCopies();
         return;
     }
@@ -1092,14 +1125,19 @@ void RasterizerVulkan::DispatchCompute() {
         .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
         .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT,
     };
-    scheduler.Record([](vk::CommandBuffer cmdbuf) { cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                               0, READ_BARRIER); });
+    if (static const bool full_before = VideoCommon::Nx2Sync::Has('b'); full_before) {
+        Nx2FullBarrier(scheduler);
+    } else {
+        scheduler.Record([](vk::CommandBuffer cmdbuf) { cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                   0, READ_BARRIER); });
+    }
     scheduler.Record([pipeline, dim](vk::CommandBuffer cmdbuf) {
         if (!pipeline->IsBound()) {
             return;
         }
         cmdbuf.Dispatch(dim[0], dim[1], dim[2]);
     });
+    Nx2AfterDispatch(scheduler);
     SubmitNx2ListCopies();
 
     // Log compute dispatch
@@ -1613,13 +1651,20 @@ AccelerateDMA::AccelerateDMA(BufferCache& buffer_cache_, TextureCache& texture_c
 
 bool AccelerateDMA::BufferClear(GPUVAddr src_address, u64 amount, u32 value) {
     std::scoped_lock lock{buffer_cache.mutex};
-    return buffer_cache.DMAClear(src_address, amount, value);
+    const bool cleared = buffer_cache.DMAClear(src_address, amount, value);
+    if (static const bool barrier_after = VideoCommon::Nx2Sync::Has('d'); barrier_after && cleared) {
+        Nx2FullBarrier(scheduler);
+    }
+    return cleared;
 }
 
 bool AccelerateDMA::BufferCopy(GPUVAddr src_address, GPUVAddr dest_address, u64 amount) {
     std::scoped_lock lock{buffer_cache.mutex};
     buffer_cache.Nx2CollectListCopies(true);
     const bool copied = buffer_cache.DMACopy(src_address, dest_address, amount);
+    if (static const bool barrier_after = VideoCommon::Nx2Sync::Has('d'); barrier_after && copied) {
+        Nx2FullBarrier(scheduler);
+    }
     if (buffer_cache.Nx2CopyListPages(scheduler.CurrentTick())) {
         scheduler.Flush();
     }

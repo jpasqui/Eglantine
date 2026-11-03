@@ -13,6 +13,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <string>
 #include <type_traits>
 #include "common/container/unordered_map.h"
 #include <vector>
@@ -40,6 +41,8 @@ struct LoweredNativeCode {
     /// Constant buffer holding the texture handles if the program requires one, otherwise ~0U
     /// (the engine's register value is used).
     u32 texture_bound = ~0U;
+    /// NativeProgramKey of the captured program (EDEN_NX2_PIPELINE_ENVS).
+    u64 key{};
 };
 
 class GenericEnvironment : public Shader::Environment {
@@ -93,6 +96,9 @@ public:
     bool HasHLEMacroState() const override {
         return has_hle_engine_state;
     }
+
+    /// EDEN_NX2_PIPELINE_ENVS: what this environment specialised a pipeline with.
+    [[nodiscard]] std::string Nx2Describe() const;
 
 protected:
     std::optional<u64> TryFindSize();

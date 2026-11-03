@@ -365,6 +365,19 @@ void TextureCache<P>::TickFrame() {
                              image_id.index, gpu_addr,
                              Common::CityHash64(reinterpret_cast<const char*>(host.data()), host.size()),
                              Nx2VolTrace::CountNonzeroWords(host), host.size() / 8);
+                    if (const char* save_dir = Nx2VolTrace::StaleSave();
+                        save_dir != nullptr &&
+                        (image.info.type == ImageType::e3D ||
+                         (image.info.size.width <= 64 && image.info.size.height <= 64))) {
+                        const std::string path = fmt::format(
+                            "{}/img-f{}-{}x{}x{}-l{}-id{}-{:x}.bin", save_dir, static_cast<u32>(image.info.format),
+                            image.info.size.width, image.info.size.height, image.info.size.depth,
+                            image.info.resources.levels, image_id.index, gpu_addr);
+                        if (std::FILE* file = std::fopen(path.c_str(), "wb")) {
+                            std::fwrite(host.data(), 1, host.size(), file);
+                            std::fclose(file);
+                        }
+                    }
                     if (Nx2VolTrace::StaleValues()) {
                         using VideoCore::Surface::PixelFormat;
                         u32 kind = 0, bpt = 0;
@@ -2814,6 +2827,11 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             LOG_INFO(HW_GPU, "range history of {:#x}+{:#x} ({}, guest nonzero words {} of {}) at frame {}:",
                      gpu_addr, new_image.guest_size_bytes, what, Nx2VolTrace::CountNonzeroWords(guest),
                      guest.size() / 8, frame_tick);
+            if (Nx2PbTrace::DownloadWatch()) {
+                LOG_INFO(HW_GPU, "  emulator writes that changed guest bytes in device {:#x}+{:#x}:{}", cpu_addr,
+                         new_image.guest_size_bytes,
+                         Nx2PbTrace::ChangedWritesOverlapping(cpu_addr, new_image.guest_size_bytes));
+            }
             bool written = false;
             for (const auto& event : Nx2VolTrace::RangeEventsOverlapping(gpu_addr, new_image.guest_size_bytes)) {
                 LOG_INFO(HW_GPU, "  frame {} {:#x}+{:#x}: {}", event.frame, event.gpu_addr, event.size,

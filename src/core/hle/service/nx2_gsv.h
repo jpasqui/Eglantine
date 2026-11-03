@@ -2887,8 +2887,29 @@ private:
                             layout.pitch, 0, bytes);
             DumpFrameRgba(bytes, layout.pitch, width, height);
             m_tiled.resize(layout.size);
-            Tegra::Texture::SwizzleTexture(m_tiled, bytes, 4, static_cast<u32>(layout.pitch / 4),
-                                           layout.height, 1, 4, 0, 1, true);
+            // Bands of whole 16-GOB block rows (128 lines): each lands in its own contiguous part
+            // of the output, so they swizzle independently (EDEN_NX2_VDEC_THREADS).
+            const u32 block_rows = static_cast<u32>((layout.height + 127) / 128);
+            const u32 bands = (std::min)(Tegra::Host1x::Nx2VideoDecoder::Threads(), block_rows);
+            const u64 block_row_bytes = (static_cast<u64>(layout.pitch) + 63) / 64 * 512 * 16;
+            if (bands > 1 && block_row_bytes * block_rows <= m_tiled.size()) {
+                const u32 rows_per_band = (block_rows + bands - 1) / bands;
+                decoder->Parallel(bands, [&](u32 band) {
+                    const u32 first_block_row = band * rows_per_band;
+                    if (first_block_row >= block_rows) return;
+                    const u32 first_line = first_block_row * 128;
+                    const u32 lines = (std::min)(rows_per_band * 128, static_cast<u32>(layout.height) - first_line);
+                    const std::span<u8> output{m_tiled.data() + first_block_row * block_row_bytes,
+                                               m_tiled.size() - first_block_row * block_row_bytes};
+                    const std::span<const u8> input{bytes.data() + u64{first_line} * layout.pitch,
+                                                    u64{lines} * layout.pitch};
+                    Tegra::Texture::SwizzleTexture(output, input, 4, static_cast<u32>(layout.pitch / 4), lines,
+                                                   1, 4, 0, 1, true);
+                });
+            } else {
+                Tegra::Texture::SwizzleTexture(m_tiled, bytes, 4, static_cast<u32>(layout.pitch / 4),
+                                               layout.height, 1, 4, 0, 1, true);
+            }
             memory.WriteBlock(address, m_tiled.data(), m_tiled.size());
             if (const auto device =
                     Nvidia::Devices::Nx2GpuMemoryRegistry::Get().DeviceAddressOf(address)) {

@@ -10,6 +10,11 @@
 // The sections using code from Ryujinx are marked with a link to the original version
 
 #include <algorithm>
+#include <cstdlib>
+#include <thread>
+#include <mutex>
+#include <functional>
+#include <condition_variable>
 #include <array>
 #include <cstring>
 #include <numeric>
@@ -850,6 +855,92 @@ bool IsValidEntry(const Tegra::MemoryManager& gpu_memory, const TICEntry& config
     return gpu_memory.GpuToCpuAddress(address, guest_size_bytes).has_value();
 }
 
+namespace {
+/// EDEN_NX2_UNSWIZZLE_THREADS: threads for unswizzling one large 2D level (1: the calling thread only).
+u32 UnswizzleThreads() {
+    static const u32 threads = [] {
+        if (const char* value = std::getenv("EDEN_NX2_UNSWIZZLE_THREADS")) {
+            return std::clamp<u32>(static_cast<u32>(std::strtoul(value, nullptr, 10)), 1, 16);
+        }
+        return 1U;
+    }();
+    return threads;
+}
+
+/// Runs job(0..count-1) on persistent worker threads and the caller; returns when all are done.
+class UnswizzlePool {
+public:
+    void Run(u32 workers, u32 count, const std::function<void(u32)>& work) {
+        {
+            std::scoped_lock lk{mutex};
+            while (threads.size() < workers) {
+                threads.emplace_back([this] { Loop(); });
+            }
+            job = &work;
+            jobs = count;
+            next = 0;
+            finished = 0;
+            ++generation;
+        }
+        wake.notify_all();
+        Help();
+        std::unique_lock lk{mutex};
+        done.wait(lk, [&] { return finished == jobs; });
+        job = nullptr;
+    }
+
+    ~UnswizzlePool() {
+        {
+            std::scoped_lock lk{mutex};
+            quit = true;
+        }
+        wake.notify_all();
+        for (auto& thread : threads) thread.join();
+    }
+
+private:
+    void Help() {
+        for (;;) {
+            u32 index;
+            const std::function<void(u32)>* work;
+            {
+                std::scoped_lock lk{mutex};
+                if (job == nullptr || next >= jobs) return;
+                index = next++;
+                work = job;
+            }
+            (*work)(index);
+            std::scoped_lock lk{mutex};
+            if (++finished == jobs) done.notify_all();
+        }
+    }
+
+    void Loop() {
+        u64 seen = 0;
+        for (;;) {
+            {
+                std::unique_lock lk{mutex};
+                wake.wait(lk, [&] { return quit || (generation != seen && job != nullptr); });
+                if (quit) return;
+                seen = generation;
+            }
+            Help();
+        }
+    }
+
+    std::mutex mutex;
+    std::condition_variable wake;
+    std::condition_variable done;
+    std::vector<std::thread> threads;
+    const std::function<void(u32)>* job{};
+    u32 jobs{};
+    u32 next{};
+    u32 finished{};
+    u64 generation{};
+    bool quit{};
+};
+} // Anonymous namespace
+
 boost::container::small_vector<BufferImageCopy, 16> UnswizzleImage(Tegra::MemoryManager& gpu_memory,
                                                                    GPUVAddr gpu_addr,
                                                                    const ImageInfo& info,
@@ -916,6 +1007,36 @@ boost::container::small_vector<BufferImageCopy, 16> UnswizzleImage(Tegra::Memory
         const u32 stride_alignment = StrideAlignment(num_tiles, info.block, gob, bpp_log2);
         size_t guest_layer_offset = 0;
 
+        const u32 band_threads = UnswizzleThreads();
+        if (band_threads > 1 && num_levels == 1 && info.resources.layers == 1 && num_tiles.depth == 1 &&
+            block.depth == 0 && host_bytes_per_layer >= (4U << 20)) {
+            // Bands of whole block rows: rows of 8 << block.height lines whose guest bytes are
+            // contiguous (block_row_bytes each), unswizzled as images of their own height.
+            const u32 lines_per_block_row = 8U << block.height;
+            const u32 block_rows = Common::DivCeil(num_tiles.height, lines_per_block_row);
+            const u32 stride = Common::AlignUpLog2(num_tiles.width, stride_alignment) << bpp_log2;
+            const u64 block_row_bytes = u64{Common::DivCeil(stride, 64U)} << (9 + block.height);
+            const u64 row_bytes = u64{num_tiles.width} << bpp_log2;
+            if (block_row_bytes * block_rows <= input.size_bytes() - guest_offset) {
+                static UnswizzlePool pool;
+                const u32 bands = (std::min)(band_threads * 2, block_rows);
+                const u32 per_band = Common::DivCeil(block_rows, bands);
+                const std::function<void(u32)> work = [&](u32 band) {
+                    const u32 first = band * per_band;
+                    if (first >= block_rows) return;
+                    const u32 first_line = first * lines_per_block_row;
+                    const u32 lines = (std::min)(per_band * lines_per_block_row, num_tiles.height - first_line);
+                    const std::span<u8> dst = output.subspan(host_offset + first_line * row_bytes, lines * row_bytes);
+                    const std::span<const u8> src = input.subspan(guest_offset + first * block_row_bytes);
+                    UnswizzleTexture(dst, src, 1U << bpp_log2, num_tiles.width, lines, 1, block.height, 0,
+                                     stride_alignment, gpu_memory.UsesNativeTiling());
+                };
+                pool.Run((std::min)(band_threads, bands) - 1, bands, work);
+                host_offset += host_bytes_per_layer;
+                guest_offset += level_sizes[level];
+                continue;
+            }
+        }
         for (s32 layer = 0; layer < info.resources.layers; ++layer) {
             const std::span<u8> dst = output.subspan(host_offset);
             const std::span<const u8> src = input.subspan(guest_offset + guest_layer_offset);

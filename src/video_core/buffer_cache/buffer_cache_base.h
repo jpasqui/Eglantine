@@ -562,6 +562,21 @@ private:
     MemoryTracker memory_tracker;
     Common::RangeSet<DAddr> uncommitted_gpu_modified_ranges;
 
+    /// EDEN_NX2_HOST_BUFFERS: buffers bound by the traced draws (kind u/s/t graphics, S/T compute).
+    struct Nx2TracedBuffer {
+        char kind;
+        u32 stage;
+        u32 slot;
+        u32 draw;
+        DAddr device_addr;
+        u32 size;
+        u32 format;
+    };
+    std::vector<Nx2TracedBuffer> nx2_traced_buffers;
+    bool nx2_traced_buffers_done = false;
+    void Nx2NoteTracedBuffer(char kind, size_t stage, u32 slot, DAddr device_addr, u32 size, u32 format);
+    void Nx2DumpTracedBuffers();
+
     /// Whether GPU-written buffer ranges are copied back to guest memory at the next fence;
     /// otherwise only when something flushes them (as upstream yuzu below High GPU accuracy).
     /// Not for Switch 2 titles: title 1 had 250-330 MB/s copied back (a fence per compute

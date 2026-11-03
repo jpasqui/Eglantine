@@ -78,6 +78,70 @@ u64 ShaderCache::MeshStateHash() const {
     return Common::CityHash64(reinterpret_cast<const char*>(state.data()), sizeof(state)) | 1;
 }
 
+int ShaderCache::Nx2VerifyMode() {
+    static const int mode = [] {
+        const char* value = std::getenv("EDEN_NX2_SHADER_VERIFY");
+        if (value == nullptr || value[0] == '\0' || value[0] == '0') {
+            return 0;
+        }
+        return value[0] == 'f' ? 2 : 1;
+    }();
+    return mode;
+}
+
+void ShaderCache::Nx2RecordCode(VAddr cpu_addr, GPUVAddr gpu_addr, const ShaderInfo* info) {
+    if (info == nullptr || !info->lowered_native) {
+        return;
+    }
+    const u32 size = static_cast<u32>((std::min<size_t>)(info->lowered_native->source_size, 1024));
+    if (size == 0 || !gpu_memory->IsFullyMappedRange(gpu_addr, size)) {
+        return;
+    }
+    Nx2CodeRecord record{.size = size, .bytes = std::vector<u8>(size)};
+    gpu_memory->ReadBlock(gpu_addr, record.bytes.data(), size);
+    nx2_code_records[cpu_addr] = std::move(record);
+}
+
+bool ShaderCache::Nx2CodeUnchanged(VAddr cpu_addr, GPUVAddr gpu_addr, const char* kind) {
+    const auto it = nx2_code_records.find(cpu_addr);
+    if (it == nx2_code_records.end()) {
+        return true;
+    }
+    const Nx2CodeRecord& record = it->second;
+    std::array<u8, 1024> now{};
+    // Cheap check on guest memory first; a difference is confirmed with a flushing read.
+    gpu_memory->ReadBlockUnsafe(gpu_addr, now.data(), record.size);
+    if (std::memcmp(now.data(), record.bytes.data(), record.size) == 0) {
+        return true;
+    }
+    gpu_memory->ReadBlock(gpu_addr, now.data(), record.size);
+    if (std::memcmp(now.data(), record.bytes.data(), record.size) == 0) {
+        return true;
+    }
+    u32 first = 0;
+    u32 differing = 0;
+    for (u32 i = 0; i < record.size; ++i) {
+        if (now[i] != record.bytes[i]) {
+            if (differing++ == 0) first = i;
+        }
+    }
+    static std::atomic<u32> logged{};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 200) {
+        u32 old_words[4]{};
+        u32 new_words[4]{};
+        const u32 at = first & ~15U;
+        std::memcpy(old_words, record.bytes.data() + at, (std::min<u32>)(16, record.size - at));
+        std::memcpy(new_words, now.data() + at, (std::min<u32>)(16, record.size - at));
+        LOG_WARNING(HW_GPU,
+                    "Stale native {} program at {:#x}: memory differs from its capture in {} of {} bytes from +{:#x} "
+                    "({:08x} {:08x} {:08x} {:08x} -> {:08x} {:08x} {:08x} {:08x}){}",
+                    kind, gpu_addr, differing, record.size, first, old_words[0], old_words[1], old_words[2],
+                    old_words[3], new_words[0], new_words[1], new_words[2], new_words[3],
+                    Nx2VerifyMode() == 2 ? ", captured again" : "");
+    }
+    return false;
+}
+
 bool ShaderCache::RefreshStages(std::array<u64, 6>& unique_hashes) try {
     auto& dirty{maxwell3d->dirty.flags};
     if (!dirty[VideoCommon::Dirty::Shaders]) {
@@ -115,6 +179,12 @@ bool ShaderCache::RefreshStages(std::array<u64, 6>& unique_hashes) try {
             return false;
         }
         const ShaderInfo* shader_info{TryGet(*cpu_shader_addr)};
+        if (shader_info && native && Nx2VerifyMode() != 0 &&
+            !Nx2CodeUnchanged(*cpu_shader_addr, shader_addr, "graphics") && Nx2VerifyMode() == 2) {
+            nx2_code_records.erase(*cpu_shader_addr);
+            InvalidateRegion(*cpu_shader_addr, 1);
+            shader_info = TryGet(*cpu_shader_addr);
+        }
         if (!shader_info && native && IsRejected(*cpu_shader_addr)) {
             // A rejected program fails the same way every time it is bound: skip its draws
             // without rethrowing (two C++ throws each time cost ~1-2% of the GPU thread).
@@ -130,6 +200,9 @@ bool ShaderCache::RefreshStages(std::array<u64, 6>& unique_hashes) try {
                 RethrowIfRejected(*cpu_shader_addr);
                 GraphicsEnvironment env{*maxwell3d, *gpu_memory, program, native ? shader_addr : base_addr, start_address};
                 shader_info = MakeShaderInfo(env, *cpu_shader_addr);
+                if (native && Nx2VerifyMode() != 0) {
+                    Nx2RecordCode(*cpu_shader_addr, shader_addr, shader_info);
+                }
             } catch (const Shader::Exception&) {
                 RememberRejection(*cpu_shader_addr);
                 // Once per program: which stage slot it is bound to, its header and the slot's
@@ -202,12 +275,21 @@ const ShaderInfo* ShaderCache::ComputeShader() {
         return nullptr;
     }
     if (const ShaderInfo* const shader = TryGet(*cpu_shader_addr)) {
-        return shader;
+        if (Nx2VerifyMode() == 0 || !shader->lowered_native ||
+            Nx2CodeUnchanged(*cpu_shader_addr, shader_addr, "compute") || Nx2VerifyMode() != 2) {
+            return shader;
+        }
+        nx2_code_records.erase(*cpu_shader_addr);
+        InvalidateRegion(*cpu_shader_addr, 1);
     }
     try {
         RethrowIfRejected(*cpu_shader_addr);
         ComputeEnvironment env{*kepler_compute, *gpu_memory, program_base, qmd.program_start};
-        return MakeShaderInfo(env, *cpu_shader_addr);
+        const ShaderInfo* const made = MakeShaderInfo(env, *cpu_shader_addr);
+        if (Nx2VerifyMode() != 0) {
+            Nx2RecordCode(*cpu_shader_addr, shader_addr, made);
+        }
+        return made;
     } catch (const Shader::Exception&) {
         RememberRejection(*cpu_shader_addr);
         throw;

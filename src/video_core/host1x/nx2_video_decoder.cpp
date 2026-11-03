@@ -1,10 +1,15 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
 #include <array>
+#include <condition_variable>
+#include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <optional>
 #include <set>
+#include <thread>
 
 #include "common/logging.h"
 #include "common/settings.h"
@@ -17,6 +22,7 @@ extern "C" {
 #pragma GCC diagnostic ignored "-Wconversion"
 #endif
 
+#include <libavutil/pixdesc.h>
 #include <libswscale/swscale.h>
 
 #if defined(__GNUC__) || defined(__clang__)
@@ -53,7 +59,80 @@ struct Nx2VideoDecoder::Impl {
     std::optional<FFmpeg::HardwareContext> hardware;
     std::optional<FFmpeg::DecoderContext> context;
     SwsContext* scaler{};
+    /// Band scalers for the threaded conversion (EDEN_NX2_VDEC_THREADS).
+    std::vector<SwsContext*> band_scalers;
     bool open{};
+
+    /// Worker threads for Parallel(): started on first use, each runs job(index) for its share.
+    struct Pool {
+        std::mutex mutex;
+        std::condition_variable wake;
+        std::condition_variable done;
+        std::vector<std::thread> threads;
+        const std::function<void(u32)>* job{};
+        u32 count{};
+        u32 next{};
+        u32 finished{};
+        u64 generation{};
+        bool quit{};
+
+        void Run(u32 workers, u32 jobs, const std::function<void(u32)>& work) {
+            {
+                std::scoped_lock lk{mutex};
+                while (threads.size() < workers) {
+                    threads.emplace_back([this] { Loop(); });
+                }
+                job = &work;
+                count = jobs;
+                next = 0;
+                finished = 0;
+                ++generation;
+            }
+            wake.notify_all();
+            Help();
+            std::unique_lock lk{mutex};
+            done.wait(lk, [&] { return finished == count; });
+            job = nullptr;
+        }
+
+        void Help() {
+            for (;;) {
+                u32 index;
+                const std::function<void(u32)>* work;
+                {
+                    std::scoped_lock lk{mutex};
+                    if (job == nullptr || next >= count) return;
+                    index = next++;
+                    work = job;
+                }
+                (*work)(index);
+                std::scoped_lock lk{mutex};
+                if (++finished == count) done.notify_all();
+            }
+        }
+
+        void Loop() {
+            u64 seen = 0;
+            for (;;) {
+                {
+                    std::unique_lock lk{mutex};
+                    wake.wait(lk, [&] { return quit || (generation != seen && job != nullptr); });
+                    if (quit) return;
+                    seen = generation;
+                }
+                Help();
+            }
+        }
+
+        ~Pool() {
+            {
+                std::scoped_lock lk{mutex};
+                quit = true;
+            }
+            wake.notify_all();
+            for (auto& thread : threads) thread.join();
+        }
+    } pool;
     /// Timestamps of submitted frames not yet output. Frames copied back from a host GPU decoder
     /// lose theirs and take the earliest one instead.
     std::multiset<u64> pending_pts;
@@ -61,6 +140,7 @@ struct Nx2VideoDecoder::Impl {
 
     ~Impl() {
         sws_freeContext(scaler);
+        for (SwsContext* band : band_scalers) sws_freeContext(band);
         context.reset();
         hardware.reset();
     }
@@ -150,6 +230,25 @@ void Nx2VideoDecoder::Reset() {
     impl->pending_pts.clear();
 }
 
+u32 Nx2VideoDecoder::Threads() {
+    static const u32 threads = [] {
+        if (const char* value = std::getenv("EDEN_NX2_VDEC_THREADS")) {
+            return std::clamp<u32>(static_cast<u32>(std::strtoul(value, nullptr, 10)), 1, 16);
+        }
+        return 1U;
+    }();
+    return threads;
+}
+
+void Nx2VideoDecoder::Parallel(u32 count, const std::function<void(u32)>& job) {
+    const u32 threads = Threads();
+    if (threads <= 1 || count <= 1) {
+        for (u32 i = 0; i < count; ++i) job(i);
+        return;
+    }
+    impl->pool.Run((std::min)(threads, count) - 1, count, job);
+}
+
 void Nx2VideoDecoder::Render(const Nx2Picture& picture, Nx2PictureFormat format, u32 width,
                              u32 height, u64 pitch, u64 chroma_offset, std::span<u8> out) {
     const AVFrame* f = picture.frame->GetFrame();
@@ -184,6 +283,58 @@ void Nx2VideoDecoder::Render(const Nx2Picture& picture, Nx2PictureFormat format,
         const int* coefficients = sws_getCoefficients(space);
         sws_setColorspaceDetails(impl->scaler, coefficients, f->color_range == AVCOL_RANGE_JPEG,
                                  coefficients, 1, 0, 1 << 16, 1 << 16);
+    }
+    const AVPixFmtDescriptor* source = av_pix_fmt_desc_get(static_cast<AVPixelFormat>(f->format));
+    const u32 bands = (std::min<u32>)(Threads(), height / 64);
+    if (format != Nx2PictureFormat::Nv12 && bands > 1 && source != nullptr &&
+        (source->flags & AV_PIX_FMT_FLAG_PLANAR) != 0 && (source->flags & AV_PIX_FMT_FLAG_HWACCEL) == 0 &&
+        source->log2_chroma_h <= 1 && static_cast<u32>(f->width) == width &&
+        static_cast<u32>(f->height) == height) {
+        // Bands start on even rows so 4:2:0 chroma rows are not split.
+        const u32 rows = ((height + bands - 1) / bands + 1) & ~1U;
+        impl->band_scalers.resize(bands, nullptr);
+        bool ok = true;
+        for (u32 band = 0; band < bands; ++band) {
+            const u32 first = band * rows;
+            const u32 count = first >= height ? 0 : (std::min)(rows, height - first);
+            if (count == 0) continue;
+            SwsContext*& context = impl->band_scalers[band];
+            context = sws_getCachedContext(context, f->width, static_cast<int>(count),
+                                           static_cast<AVPixelFormat>(f->format), static_cast<int>(width),
+                                           static_cast<int>(count), target, SWS_BILINEAR, nullptr, nullptr,
+                                           nullptr);
+            if (context == nullptr) {
+                ok = false;
+                break;
+            }
+            int space = SWS_CS_ITU601;
+            if (f->colorspace == AVCOL_SPC_BT709 ||
+                (f->colorspace == AVCOL_SPC_UNSPECIFIED && f->height >= 720)) {
+                space = SWS_CS_ITU709;
+            } else if (f->colorspace == AVCOL_SPC_BT2020_NCL || f->colorspace == AVCOL_SPC_BT2020_CL) {
+                space = SWS_CS_BT2020;
+            }
+            const int* coefficients = sws_getCoefficients(space);
+            sws_setColorspaceDetails(context, coefficients, f->color_range == AVCOL_RANGE_JPEG, coefficients, 1,
+                                     0, 1 << 16, 1 << 16);
+        }
+        if (ok) {
+            Parallel(bands, [&](u32 band) {
+                const u32 first = band * rows;
+                if (first >= height) return;
+                const u32 count = (std::min)(rows, height - first);
+                std::array<const u8*, 4> src{};
+                for (int plane = 0; plane < 4 && f->data[plane] != nullptr; ++plane) {
+                    const u32 shift = (plane == 1 || plane == 2) ? source->log2_chroma_h : 0;
+                    src[plane] = f->data[plane] + static_cast<ptrdiff_t>(first >> shift) * f->linesize[plane];
+                }
+                std::array<u8*, 4> dst{out.data() + first * pitch, nullptr, nullptr, nullptr};
+                std::array<int, 4> dst_strides{static_cast<int>(pitch), 0, 0, 0};
+                sws_scale(impl->band_scalers[band], src.data(), f->linesize, 0, static_cast<int>(count),
+                          dst.data(), dst_strides.data());
+            });
+            return;
+        }
     }
     std::array<u8*, 4> planes{out.data(), nullptr, nullptr, nullptr};
     std::array<int, 4> strides{static_cast<int>(pitch), 0, 0, 0};

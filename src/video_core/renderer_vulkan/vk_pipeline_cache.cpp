@@ -739,6 +739,16 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     if (title_id == 0) {
         return;
     }
+    if (const char* skip = std::getenv("EDEN_NX2_NO_DISK_PIPELINES"); skip != nullptr && skip[0] != '0') {
+        LOG_INFO(Render_Vulkan, "EDEN_NX2_NO_DISK_PIPELINES: the disk pipeline cache is neither read nor written");
+        return;
+    }
+    static const bool disk_trace = [] {
+        const char* value = std::getenv("EDEN_NX2_DISK_PIPELINE_TRACE");
+        return value != nullptr && value[0] != '0';
+    }();
+    std::unordered_map<u64, u32> nx2_graphics_seen;
+    std::unordered_map<u64, u32> nx2_compute_seen;
     if (!pipeline_cache_filename.empty()) {
         serialization_thread.WaitForRequests();
         if (use_vulkan_pipeline_cache && !vulkan_pipeline_cache_filename.empty()) {
@@ -780,6 +790,9 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     const auto load_compute{[&](std::ifstream& file, FileEnvironment env) {
         ComputePipelineCacheKey key;
         file.read(reinterpret_cast<char*>(&key), sizeof(key));
+        if (disk_trace) {
+            ++nx2_compute_seen[key.Hash()];
+        }
 
         workers.QueueWork([this, key, env_ = std::move(env), &state, &callback]() mutable {
             ShaderPools pools;
@@ -798,6 +811,18 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     const auto load_graphics{[&](std::ifstream& file, std::vector<FileEnvironment> envs) {
         GraphicsPipelineCacheKey key;
         file.read(reinterpret_cast<char*>(&key), sizeof(key));
+        if (disk_trace) {
+            const u32 copies = ++nx2_graphics_seen[key.Hash()];
+            if (copies == 2) {
+                static u32 logged{};
+                if (logged++ < 200) {
+                    LOG_INFO(Render_Vulkan, "disk pipeline key {:016x} stored again (unique hashes {:016x} {:016x} "
+                             "{:016x} {:016x} {:016x} {:016x})", key.Hash(), key.unique_hashes[0],
+                             key.unique_hashes[1], key.unique_hashes[2], key.unique_hashes[3],
+                             key.unique_hashes[4], key.unique_hashes[5]);
+                }
+            }
+        }
 
         // Task/mesh pipelines are not stored (their mesh registers are not in the format); skip
         // any that were.
@@ -870,6 +895,20 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
                                load_graphics);
 
     LOG_INFO(Render_Vulkan, "Total Pipeline Count: {}", state.total);
+    if (disk_trace) {
+        u64 graphics_entries = 0, graphics_repeated = 0, compute_entries = 0, compute_repeated = 0;
+        for (const auto& [hash, copies] : nx2_graphics_seen) {
+            graphics_entries += copies;
+            graphics_repeated += copies > 1;
+        }
+        for (const auto& [hash, copies] : nx2_compute_seen) {
+            compute_entries += copies;
+            compute_repeated += copies > 1;
+        }
+        LOG_INFO(Render_Vulkan, "disk pipeline cache: {} graphics entries for {} keys ({} keys stored more than once), "
+                 "{} compute entries for {} keys ({} more than once)", graphics_entries, nx2_graphics_seen.size(),
+                 graphics_repeated, compute_entries, nx2_compute_seen.size(), compute_repeated);
+    }
     if (skipped_pipelines != 0) {
         LOG_INFO(Render_Vulkan,
                  "{} cached graphics pipelines are built when first needed",
@@ -1247,6 +1286,18 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
     main_pools.ReleaseContents();
     auto pipeline{
         CreateGraphicsPipeline(main_pools, graphics_key, environments.Span(), nullptr, true)};
+    if (static const bool trace = std::getenv("EDEN_NX2_PIPELINE_ENVS") != nullptr; trace) {
+        static u32 logged{};
+        if (logged++ < 6000) {
+            std::string stages;
+            for (Shader::Environment* const env : environments.Span()) {
+                stages += fmt::format(" | s{} {}", static_cast<u32>(env->ShaderStage()),
+                                      static_cast<VideoCommon::GenericEnvironment*>(env)->Nx2Describe());
+            }
+            LOG_INFO(Render_Vulkan, "pipeline env {:016x}{}{}", graphics_key.Hash(), pipeline ? "" : " (failed)",
+                     stages);
+        }
+    }
     if (!pipeline || pipeline_cache_filename.empty()) {
         return pipeline;
     }

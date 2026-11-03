@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <functional>
 #include <memory>
 #include <span>
 #include <string>
@@ -58,6 +59,12 @@ public:
     /// `chroma_offset`, scaled to width x height.
     void Render(const Nx2Picture& picture, Nx2PictureFormat format, u32 width, u32 height,
                 u64 pitch, u64 chroma_offset, std::span<u8> out);
+
+    /// Runs job(0..count-1) on the decoder's worker threads (and this one), returns when all are done.
+    void Parallel(u32 count, const std::function<void(u32)>& job);
+
+    /// EDEN_NX2_VDEC_THREADS: threads for converting and swizzling large frames (1: on the decoder thread only).
+    static u32 Threads();
 
 private:
     struct Impl;

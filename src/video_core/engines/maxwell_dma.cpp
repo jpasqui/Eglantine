@@ -12,6 +12,7 @@
 #include "common/settings.h"
 #include "core/core.h"
 #include "video_core/engines/maxwell_3d.h"
+#include "video_core/nx2_sync.h"
 #include "video_core/engines/maxwell_dma.h"
 #include "video_core/guest_memory.h"
 #include "video_core/memory_manager.h"
@@ -199,8 +200,21 @@ void MaxwellDMA::Launch() {
         if (regs.launch_dma.remap_enable != 0 && is_const_a_dst) {
             const u32 component_size = regs.remap_const.component_size_minus_one + 1;
             ASSERT(component_size == 1 || component_size == 2 || component_size == 4);
+            bool cleared = false;
             if (component_size == 4) {
-                accelerate.BufferClear(regs.offset_out, regs.line_length_in, regs.remap_const.remap_consta_value);
+                cleared = accelerate.BufferClear(regs.offset_out, regs.line_length_in, regs.remap_const.remap_consta_value);
+            }
+            if (VideoCommon::Nx2Sync::FillTrace()) {
+                static u32 traced{};
+                if (traced++ < 256) {
+                    LOG_INFO(HW_GPU,
+                             "nx2 fill {:#x} words {} comp {}x{} dst_x {} dst_y {} value {:#x} host cleared {}",
+                             GPUVAddr(regs.offset_out), regs.line_length_in, component_size,
+                             regs.remap_const.num_dst_components_minus_one + 1,
+                             static_cast<u32>(regs.remap_const.dst_x.Value()),
+                             static_cast<u32>(regs.remap_const.dst_y.Value()),
+                             regs.remap_const.remap_consta_value, cleared);
+                }
             }
             read_buffer.resize_destructive(regs.line_length_in * sizeof(u32));
             std::ranges::fill(std::span<u32>(reinterpret_cast<u32*>(read_buffer.data()), regs.line_length_in), regs.remap_const.remap_consta_value);

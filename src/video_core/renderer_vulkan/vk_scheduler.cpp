@@ -19,6 +19,7 @@
 #include "video_core/renderer_vulkan/vk_command_pool.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
+#include "video_core/nx2_sync.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_state_tracker.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
@@ -231,6 +232,19 @@ void Scheduler::RequestRenderpass(const Framebuffer* framebuffer) {
     }
     // Ends any active pass and realizes a deferred clear
     EndRenderPass();
+    if (static const bool full_before = VideoCommon::Nx2Sync::Has('r'); full_before) {
+        // EDEN_NX2_SYNC=r: every earlier write visible to the pass.
+        static constexpr VkMemoryBarrier FULL_BARRIER{
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .pNext = nullptr,
+            .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+        };
+        Record([](vk::CommandBuffer cmdbuf) {
+            cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0,
+                                   FULL_BARRIER);
+        });
+    }
     BeginRenderPassImpl(framebuffer, renderpass, nullptr, 0);
 }
 

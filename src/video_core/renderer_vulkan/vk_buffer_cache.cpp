@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "video_core/buffer_cache/buffer_cache_base.h"
+#include "video_core/nx2_sync.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vertex_repack.h"
 
@@ -467,6 +468,9 @@ void BufferCacheRuntime::Finish() {
 bool BufferCacheRuntime::CanReorderUpload(const Buffer& buffer,
                                           std::span<const VideoCommon::BufferCopy> copies) {
     if (Settings::values.disable_buffer_reorder) {
+        return false;
+    }
+    if (static const bool no_reorder = VideoCommon::Nx2Sync::Has('u'); no_reorder) {
         return false;
     }
     const bool can_use_upload_cmdbuf =

@@ -14,6 +14,7 @@
 #include <span>
 #include "common/container/unordered_map.h"
 #include <utility>
+#include <unordered_map>
 #include <vector>
 
 #include "common/common_types.h"
@@ -104,6 +105,18 @@ protected:
 
     std::array<const ShaderInfo*, NUM_PROGRAMS> shader_infos{};
     bool last_shaders_valid = false;
+
+    /// EDEN_NX2_SHADER_VERIFY: 0 off, 1 log, 2 log and capture again.
+    static int Nx2VerifyMode();
+    /// Records the first bytes of a newly captured native program.
+    void Nx2RecordCode(VAddr cpu_addr, GPUVAddr gpu_addr, const ShaderInfo* info);
+    /// False when memory at the program no longer holds the bytes it was captured from.
+    bool Nx2CodeUnchanged(VAddr cpu_addr, GPUVAddr gpu_addr, const char* kind);
+    struct Nx2CodeRecord {
+        u32 size{};
+        std::vector<u8> bytes;
+    };
+    std::unordered_map<VAddr, Nx2CodeRecord> nx2_code_records;
 
 private:
     friend struct ShaderCacheTestAccess;

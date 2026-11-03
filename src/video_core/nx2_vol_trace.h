@@ -389,6 +389,15 @@ inline std::pair<u32, u32> ValueKind(u32 pixel_format) {
     }
 }
 
+/// EDEN_NX2_STALE_SAVE=<dir>: with the stale trace, the folder that receives the small sampled images.
+inline const char* StaleSave() {
+    static const char* const dir = [] {
+        const char* value = std::getenv("EDEN_NX2_STALE_SAVE");
+        return (value != nullptr && value[0] != '\0') ? value : nullptr;
+    }();
+    return dir;
+}
+
 /// EDEN_NX2_STALE_VALUES: with the stale trace, value statistics of each sampled image at the end of the frame.
 inline bool StaleValues() {
     static const bool enabled = std::getenv("EDEN_NX2_STALE_VALUES") != nullptr;

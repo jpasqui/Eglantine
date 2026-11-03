@@ -14,6 +14,7 @@
 #include <cstring>
 #include <string>
 #include <fstream>
+#include <map>
 #include <memory>
 #include <optional>
 #include <utility>
@@ -232,6 +233,37 @@ size_t GenericEnvironment::ReadSizeBytes() const noexcept {
 
 bool GenericEnvironment::CanBeSerialized() const noexcept {
     return !has_unbound_instructions;
+}
+
+std::string GenericEnvironment::Nx2Describe() const {
+    std::string text = fmt::format("key {:016x} at {:#x}", lowered_native ? lowered_native->key : 0, program_base);
+    std::vector<std::pair<u32, u32>> types;
+    for (const auto& [handle, type] : texture_types) types.emplace_back(handle, static_cast<u32>(type));
+    std::sort(types.begin(), types.end());
+    text += " types";
+    for (const auto& [handle, type] : types) text += fmt::format(" {:x}:{}", handle, type);
+    std::vector<std::pair<u32, u32>> formats;
+    for (const auto& [handle, format] : texture_pixel_formats) formats.emplace_back(handle, static_cast<u32>(format));
+    std::sort(formats.begin(), formats.end());
+    text += " formats";
+    for (const auto& [handle, format] : formats) text += fmt::format(" {:x}:{}", handle, format);
+    std::vector<std::pair<u64, u32>> words(cbuf_values.begin(), cbuf_values.end());
+    std::sort(words.begin(), words.end());
+    std::map<u32, std::pair<u32, u64>> banks;
+    std::string others;
+    u32 listed = 0;
+    for (const auto& [cbuf_key, value] : words) {
+        const u32 bank = static_cast<u32>(cbuf_key >> 32);
+        auto& [count, hash] = banks[bank];
+        ++count;
+        hash = (hash ^ cbuf_key ^ (u64{value} << 17)) * 0x100000001b3ULL;
+        if (bank != 1 && listed++ < 24) {
+            others += fmt::format(" {:x}:{:x}={:x}", bank, static_cast<u32>(cbuf_key), value);
+        }
+    }
+    text += " cbufs";
+    for (const auto& [bank, entry] : banks) text += fmt::format(" b{:x}:{}/{:016x}", bank, entry.first, entry.second);
+    return text + others;
 }
 
 u64 GenericEnvironment::CalculateHash() const {
@@ -478,6 +510,7 @@ std::shared_ptr<const LoweredNativeCode> GenericEnvironment::LowerNativeCode(u32
         if (status == Shader::Ampere::ProgramCaptureState::Result::Complete) break;
     }
     auto lowered = Shader::Ampere::LowerToMaxwell(native);
+    const u64 native_key = Shader::Ampere::NativeProgramKey(native);
     // EDEN_NX2_REJECT=<hex address or program key>,...: treat these programs as rejected (to find which newly
     // lowered program changes a game's behaviour without rebuilding).
     if (static const std::string reject_list = [] {
@@ -568,6 +601,7 @@ std::shared_ptr<const LoweredNativeCode> GenericEnvironment::LowerNativeCode(u32
     auto result = std::make_shared<LoweredNativeCode>();
     result->texture_bound = lowered.required_texture_buffer;
     result->source_size = native_header_size + lowered.source_size;
+    result->key = native_key;
     auto& lowered_code = result->code;
     lowered_code.resize(sizeof(sph) / sizeof(u64));
     std::memcpy(lowered_code.data(), &sph, sizeof(sph));

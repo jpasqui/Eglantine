@@ -10,6 +10,7 @@
 #include "video_core/engines/fermi_2d.h"
 #include "video_core/engines/sw_blitter/blitter.h"
 #include "video_core/memory_manager.h"
+#include "video_core/nx2.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/surface.h"
 #include "video_core/textures/decoders.h"
@@ -95,6 +96,20 @@ void Fermi2D::Blit() {
     const auto bytes_per_pixel = BytesPerBlock(PixelFormatFromRenderTargetFormat(src.format));
     const bool delegate_to_gpu = src.width > 512 && src.height > 512 && bytes_per_pixel <= 8 &&
                                  src.format != regs.dst.format;
+    // EDEN_NX2_BLIT_GPU_KIB=<n>: copies of at least n KiB go through the texture cache too; Switch 2
+    // titles default to 1024 (the title movie frame was copied by the software blitter on the GPU
+    // thread every frame, which held the menu at ~16 fps), others to 0 (never). =0 turns it off.
+    static const u64 gpu_blit_bytes = [] {
+        const char* value = std::getenv("EDEN_NX2_BLIT_GPU_KIB");
+        if (value != nullptr) {
+            return std::strtoull(value, nullptr, 10) * 1024;
+        }
+        return Tegra::g_nx2_ampere.load(std::memory_order_relaxed) ? 1024ULL * 1024 : 0ULL;
+    }();
+    const u64 dst_bytes = static_cast<u64>(regs.pixels_from_memory.dst_width) *
+                          static_cast<u64>(regs.pixels_from_memory.dst_height) *
+                          BytesPerBlock(PixelFormatFromRenderTargetFormat(regs.dst.format));
+    const bool large_copy = gpu_blit_bytes != 0 && dst_bytes >= gpu_blit_bytes;
 
     auto srcX = args.src_x0;
     auto srcY = args.src_y0;
@@ -107,7 +122,7 @@ void Fermi2D::Blit() {
         .operation = regs.operation,
         .filter = args.sample_mode.filter,
         .must_accelerate =
-            args.du_dx != null_derivative || args.dv_dy != null_derivative || delegate_to_gpu,
+            args.du_dx != null_derivative || args.dv_dy != null_derivative || delegate_to_gpu || large_copy,
         .dst_x0 = args.dst_x0,
         .dst_y0 = args.dst_y0,
         .dst_x1 = args.dst_x0 + args.dst_width,
@@ -133,6 +148,17 @@ void Fermi2D::Blit() {
 
     memory_manager.FlushCaching();
     if (!rasterizer->AccelerateSurfaceCopy(src, regs.dst, config)) {
+        if (static const bool trace = std::getenv("EDEN_NX2_BLIT_TRACE") != nullptr; trace) {
+            static u32 traced{};
+            if (traced++ < 64) {
+                LOG_INFO(HW_GPU, "software 2D blit {:#x} {}x{} f{:#x} {} -> {:#x} {}x{} f{:#x} {} rect {}x{} ({} KiB)",
+                         src.Address(), src.width, src.height, static_cast<u32>(src.format),
+                         src.linear == MemoryLayout::Pitch ? "pitch" : "block", regs.dst.Address(), regs.dst.width,
+                         regs.dst.height, static_cast<u32>(regs.dst.format),
+                         regs.dst.linear == MemoryLayout::Pitch ? "pitch" : "block", args.dst_width, args.dst_height,
+                         dst_bytes / 1024);
+            }
+        }
         sw_blitter->Blit(src, regs.dst, config);
     }
 }
