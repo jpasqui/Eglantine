@@ -258,6 +258,12 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
         return;
     }
     DAddr cpu_addr = *cpu_addr_opt;
+    // A mirrored release (puller, Switch 2) never moves its word backwards.
+    const bool monotonic = Tegra::g_nx2_writing_mirror && Tegra::Nx2MonotonicMirrorOn();
+    if (counter_type == QueryType::Payload && Tegra::Nx2SemAliasTraceOn()) {
+        Tegra::Nx2SemAliasNote(cpu_addr, addr, gpu_memory->GetID(), payload,
+                               is_fence ? "fence release" : "release", this->current_channel_id);
+    }
     const size_t new_query_id = streamer->WriteCounter(cpu_addr, has_timestamp, payload, subreport);
     auto* query = streamer->GetQuery(new_query_id);
     if (is_fence) {
@@ -274,7 +280,7 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
     u8* pointer_timestamp = impl->device_memory.template GetPointer<u8>(cpu_addr + 8);
     bool is_synced = (Settings::IsGPUFenceBehaviorDefault() ? !Settings::IsGPULevelHigh() : !Settings::IsGPUFenceBehaviorBalanced() && !Settings::IsGPUFenceBehaviorAccurate()) && is_fence;
     std::function<void()> operation([this, is_synced, streamer, query_base = query, query_location,
-                                     pointer, pointer_timestamp, cpu_addr] {
+                                     pointer, pointer_timestamp, cpu_addr, monotonic, addr] {
         if (True(query_base->flags & QueryFlagBits::IsInvalidated)) {
             if (!is_synced) [[likely]] {
                 impl->pending_unregister.push_back(query_location);
@@ -291,6 +297,20 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
         }
         query_base->value += streamer->GetAmendValue();
         streamer->SetAccumulationValue(query_base->value);
+        if (monotonic) {
+            u32 current;
+            std::memcpy(&current, pointer, sizeof(current));
+            if (Tegra::Nx2MirrorWouldLower(current, static_cast<u32>(query_base->value))) {
+                if (static std::atomic<u32> skipped{}; skipped.fetch_add(1) < 8) {
+                    LOG_INFO(HW_GPU, "Mirrored semaphore release {:#x}={:#x} skipped: the word holds {:#x}",
+                             addr, static_cast<u32>(query_base->value), current);
+                }
+                if (!is_synced) [[likely]] {
+                    impl->pending_unregister.push_back(query_location);
+                }
+                return;
+            }
+        }
         if (True(query_base->flags & QueryFlagBits::HasTimestamp)) {
             u64 timestamp = impl->gpu.GetTicks();
             std::memcpy(pointer_timestamp, &timestamp, sizeof(timestamp));
@@ -308,6 +328,14 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
         impl->rasterizer.SignalFence(std::move(operation));
     } else {
         if (!Settings::IsGPULevelHigh() && counter_type == QueryType::Payload) {
+            if (monotonic) {
+                u32 current;
+                std::memcpy(&current, pointer, sizeof(current));
+                if (Tegra::Nx2MirrorWouldLower(current, payload)) {
+                    streamer->Free(new_query_id);
+                    return;
+                }
+            }
             if (has_timestamp) {
                 u64 timestamp = impl->gpu.GetTicks();
                 u64 value = static_cast<u64>(payload);

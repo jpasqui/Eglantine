@@ -26,6 +26,7 @@
 #include "video_core/gpu.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/memory_manager.h"
+#include "video_core/nx2.h"
 #include "video_core/rasterizer_interface.h"
 
 namespace Service::Nvidia::Devices {
@@ -179,6 +180,11 @@ void nvhost_as_gpu::Nx2Map(u64 gpu_address, u64 cpu_address, u64 size) {
     system.GPU().MapInOrder([gmmu = gmmu.get(), gpu_address, device_address, size] {
         gmmu->Map(gpu_address, device_address, size, Tegra::PTEKind::PITCH, false);
     });
+    if (Tegra::Nx2SemAliasTraceOn() && size <= 0x10000) {
+        LOG_INFO(Service_NVDRV, "Switch 2 GPU mapping {:#x}+{:#x} -> CPU {:#x} device {:#x} (as fd {}, {})",
+                 gpu_address, size, cpu_address, device_address, static_cast<const void*>(this),
+                 range.heap ? "heap mapper" : "SMMU");
+    }
     LOG_DEBUG(Service_NVDRV, "Switch 2 GPU mapping {:#x}+{:#x} -> CPU {:#x}", gpu_address, size,
               cpu_address);
 }
@@ -219,6 +225,10 @@ void nvhost_as_gpu::Nx2Release(u64 cpu_address, u64 size) {
         smmu.Unmap(range.address, size);
         smmu.Free(range.address, Common::AlignUp(size, 0x20000));
     });
+    if (Tegra::Nx2SemAliasTraceOn() && size <= 0x10000) {
+        LOG_INFO(Service_NVDRV, "Switch 2 released backing {:#x}+{:#x} device {:#x}", cpu_address, size,
+                 range.address);
+    }
     LOG_DEBUG(Service_NVDRV, "Switch 2 released backing {:#x}+{:#x}", cpu_address, size);
 }
 

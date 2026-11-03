@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdlib>
 #include <functional>
 #include <map>
 #include <mutex>
@@ -109,6 +110,37 @@ inline void Nx2AddSemaphoreRegion(u64 start) {
             return;
         }
     }
+}
+
+/// Set while the puller writes a mirrored release (see Nx2SemaphoreMirror). Such a write never moves
+/// its word backwards: Pikmin 4's movie queue releases the value the main queue acquires straight into
+/// a first-page word, and its own (smaller) progress into the second page at the same offset; mirroring
+/// that over the direct value made an acquire that registered after the direct release wait forever.
+/// EDEN_NX2_SEM_MIRROR_MONOTONIC=0: mirror plainly.
+inline thread_local bool g_nx2_writing_mirror = false;
+
+inline bool Nx2MonotonicMirrorOn() {
+    static const bool on = [] {
+        const char* value = std::getenv("EDEN_NX2_SEM_MIRROR_MONOTONIC");
+        return value == nullptr || value[0] != '0';
+    }();
+    return on;
+}
+
+/// True when a mirrored write of `value` over `current` would move the word backwards.
+[[nodiscard]] inline bool Nx2MirrorWouldLower(u32 current, u32 value) {
+    return static_cast<s32>(value - current) < 0;
+}
+
+/// True when `address` is in the first page of a semaphore region (where mirrors land).
+inline bool Nx2InSemaphoreFirstPage(u64 address) {
+    for (const auto& region : g_nx2_semaphore_regions) {
+        const u64 start = region.load(std::memory_order_relaxed);
+        if (start != 0 && address >= start && address < start + 0x1000) {
+            return true;
+        }
+    }
+    return false;
 }
 
 /// The region's memory was destroyed: stop mirroring into it.
@@ -329,6 +361,17 @@ inline bool Nx2SparseUnwritten(u64 gpu_address, u64 size) {
     }
     return true;
 }
+
+/// EDEN_NX2_SEM_ALIAS_TRACE=1: semaphore writes by device word; logs when a second GPU address
+/// (or address space) writes a word another one wrote (each pair once, at most 64 lines).
+inline bool Nx2SemAliasTraceOn() {
+    static const bool on = std::getenv("EDEN_NX2_SEM_ALIAS_TRACE") != nullptr;
+    return on;
+}
+void Nx2SemAliasNote(u64 device_address, u64 gpu_address, u64 asid, u32 value, const char* source,
+                     u64 channel = ~u64{0});
+void Nx2SemAliasWatch(u64 device_address);
+void Nx2SemAliasCheckRead(u64 device_address, u32 current, const char* where);
 
 /// GPU VA in the first page that mirrors a release at `address`, or 0.
 inline u64 Nx2SemaphoreMirror(u64 address) {

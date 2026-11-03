@@ -6,6 +6,9 @@
 
 #include <atomic>
 #include <cstdlib>
+#include <mutex>
+#include <unordered_map>
+#include <vector>
 
 #include "common/assert.h"
 #include "common/logging.h"
@@ -61,6 +64,76 @@ void DrainBack() {
 
 } // Anonymous namespace
 
+} // namespace Tegra::Engines
+
+namespace Tegra {
+namespace {
+struct Nx2AliasWriter {
+    u64 gpu;
+    u64 asid;
+    u64 channel;
+    u32 value;
+    const char* source;
+};
+std::mutex g_alias_mutex;
+std::unordered_map<u64, std::vector<Nx2AliasWriter>> g_alias_writers;
+std::unordered_map<u64, u32> g_alias_last_value; // device word -> last traced GPU write
+std::atomic<u64> g_alias_watch{};                 // device word of the first suspended acquire
+} // Anonymous namespace
+
+void Nx2SemAliasNote(u64 device_address, u64 gpu_address, u64 asid, u32 value, const char* source,
+                     u64 channel) {
+    static u32 lines = 0;
+    static u32 watch_lines = 0;
+    const u64 word = device_address & ~u64{3};
+    std::scoped_lock lk{g_alias_mutex};
+    g_alias_last_value[word] = value;
+    if (word == g_alias_watch.load(std::memory_order_relaxed) && watch_lines < 400) {
+        ++watch_lines;
+        LOG_INFO(HW_GPU, "Semaphore word {:#x}: {} {:#x} by GPU {:#x} as {} channel {}", word, source,
+                 value, gpu_address, asid, channel);
+    }
+    auto& list = g_alias_writers[word];
+    for (auto& w : list) {
+        if (w.gpu == gpu_address && w.asid == asid && w.channel == channel) {
+            w.value = value;
+            w.source = source;
+            return;
+        }
+    }
+    if (!list.empty() && lines < 64) {
+        ++lines;
+        const auto& first = list.front();
+        LOG_WARNING(HW_GPU, "Semaphore alias: device {:#x} written by GPU {:#x} as {} channel {} ({}, value {:#x}) "
+                    "and before by GPU {:#x} as {} channel {} ({}, last value {:#x}); {} writers",
+                    device_address, gpu_address, asid, channel, source, value, first.gpu, first.asid,
+                    first.channel, first.source, first.value, list.size() + 1);
+    }
+    list.push_back({gpu_address, asid, channel, value, source});
+}
+
+void Nx2SemAliasWatch(u64 device_address) {
+    u64 expected = 0;
+    if (g_alias_watch.compare_exchange_strong(expected, device_address & ~u64{3})) {
+        LOG_INFO(HW_GPU, "Semaphore word {:#x}: watched", device_address & ~u64{3});
+    }
+}
+
+void Nx2SemAliasCheckRead(u64 device_address, u32 current, const char* where) {
+    static u32 lines = 0;
+    const u64 word = device_address & ~u64{3};
+    std::scoped_lock lk{g_alias_mutex};
+    const auto it = g_alias_last_value.find(word);
+    if (it != g_alias_last_value.end() && it->second != current && lines < 200) {
+        ++lines;
+        LOG_INFO(HW_GPU, "Semaphore word {:#x} reads {:#x} at {}, last traced GPU write {:#x}", word, current,
+                 where, it->second);
+    }
+}
+} // namespace Tegra
+
+namespace Tegra::Engines {
+
 bool Puller::PendingAcquire::Matches(u32 current) const {
     switch (static_cast<GpuSemaphoreOperation>(operation)) {
     case GpuSemaphoreOperation::AcquireEqual:
@@ -82,6 +155,11 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
     // ReadSemaphoreWord asks are its state).
     DrainBack();
     const u32 current = ReadSemaphoreWord(dma_pusher, pending_acquire->address);
+    if (Nx2SemAliasTraceOn()) {
+        if (const auto device = dma_pusher.memory_manager.GpuToCpuAddress(pending_acquire->address)) {
+            Nx2SemAliasCheckRead(*device, current, "pending acquire");
+        }
+    }
     if (Nx2SemaphoreWaiters::Get().Latched(this)) {
         if (static std::atomic<u32> rescued{};
             !pending_acquire->Matches(current) && rescued.fetch_add(1) < 64) {
@@ -224,9 +302,13 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
         }
         OnBack([rasterizer = dma_pusher.rasterizer, sequence_address, mirror, properties, payload] {
             rasterizer->Query(sequence_address, VideoCommon::QueryType::Payload, properties, payload, 0);
-            if (mirror != 0) {
-                rasterizer->Query(mirror, VideoCommon::QueryType::Payload, properties, payload, 0);
+            if (mirror == 0) {
+                return;
             }
+            // Never moves the word backwards (checked when the write lands, see g_nx2_writing_mirror).
+            g_nx2_writing_mirror = true;
+            rasterizer->Query(mirror, VideoCommon::QueryType::Payload, properties, payload, 0);
+            g_nx2_writing_mirror = false;
         });
     } else if (g_nx2_ampere) {
         // Switch 2 waits on semaphores the CPU (or another channel) releases, e.g. once it has
@@ -246,7 +328,16 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
         }
         VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquireChecks, 1);
         DrainBack();
-        if (acquire.Matches(ReadSemaphoreWord(dma_pusher, acquire.address))) {
+        const u32 first_read = ReadSemaphoreWord(dma_pusher, acquire.address);
+        if (Nx2SemAliasTraceOn() && Nx2InSemaphoreFirstPage(acquire.address)) {
+            static std::atomic<u32> logged{};
+            if (logged.fetch_add(1) < 200) {
+                LOG_INFO(HW_GPU, "Semaphore region acquire: channel {} {:#x} op {} {:#x}, reads {:#x}{}",
+                         dma_pusher.channel_state.bind_id, acquire.address, acquire.operation, acquire.value,
+                         first_read, acquire.Matches(first_read) ? " (met)" : "");
+            }
+        }
+        if (acquire.Matches(first_read)) {
             return;
         }
         // Registered before the fences run, so a release among them that meets the value counts
@@ -254,6 +345,17 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
         auto& waiters = Nx2SemaphoreWaiters::Get();
         if (const auto device = dma_pusher.memory_manager.GpuToCpuAddress(acquire.address)) {
             waiters.Add(this, *device, acquire.value, acquire.operation);
+            if (Nx2SemAliasTraceOn()) {
+                Nx2SemAliasWatch(*device);
+                Nx2SemAliasCheckRead(*device, dma_pusher.memory_manager.Read<u32>(acquire.address), "acquire");
+                static std::atomic<u32> logged{};
+                if (logged.fetch_add(1) < 32) {
+                    LOG_INFO(HW_GPU, "Semaphore acquire: channel {} as {} GPU {:#x} device {:#x} op {} {:#x} (now {:#x})",
+                             dma_pusher.channel_state.bind_id, dma_pusher.memory_manager.GetID(),
+                             acquire.address, *device, acquire.operation, acquire.value,
+                             dma_pusher.memory_manager.Read<u32>(acquire.address));
+                }
+            }
         }
         dma_pusher.rasterizer->ReleaseFences();
         if (!waiters.Latched(this) && !acquire.Matches(ReadSemaphoreWord(dma_pusher, acquire.address))) {
