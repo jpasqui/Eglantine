@@ -598,6 +598,7 @@ jobs:
           ls -la dist
 
       - name: Create release
+        id: create
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -644,15 +645,25 @@ jobs:
           fi
           test -n "$(ls dist)"
 
-          gh release create "${tag}" dist/* \
-            --repo "${GITHUB_REPOSITORY}" \
-            --target "${GITHUB_SHA}" \
-            --prerelease \
-            --title "Eglantine ${GITHUB_REF_NAME} build ${GITHUB_RUN_NUMBER} (${GITHUB_SHA::7})" \
-            --notes-file notes.md
+          # A re-run of the failed jobs (GitHub's macOS arm64 runners often aren't acquired in time)
+          # keeps the run number, so it adds its files to the release the first attempt made.
+          if gh release view "${tag}" --repo "${GITHUB_REPOSITORY}" > /dev/null 2>&1; then
+            gh release upload "${tag}" dist/* --repo "${GITHUB_REPOSITORY}" --clobber
+            gh release edit "${tag}" --repo "${GITHUB_REPOSITORY}" --notes-file notes.md
+            echo "created=false" >> "$GITHUB_OUTPUT"
+          else
+            gh release create "${tag}" dist/* \
+              --repo "${GITHUB_REPOSITORY}" \
+              --target "${GITHUB_SHA}" \
+              --prerelease \
+              --title "Eglantine ${GITHUB_REF_NAME} build ${GITHUB_RUN_NUMBER} (${GITHUB_SHA::7})" \
+              --notes-file notes.md
+            echo "created=true" >> "$GITHUB_OUTPUT"
+          fi
 
       # Skipped on forks without a DISCORD_WEBHOOK_URL secret; the role mention is upstream's server only.
       - name: Ping Discord
+        if: steps.create.outputs.created == 'true'
         shell: bash
         env:
           WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_URL }}
