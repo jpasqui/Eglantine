@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <thread>
 #include <chrono>
 #include <condition_variable>
@@ -3365,25 +3366,77 @@ private:
     // Answers every armed wait: the value page is current, so the client rechecks its threshold
     // and rearms if it still has to wait. Acknowledging without a value change costs the client a
     // wakeup per poll, which keeps waits whose syncpoint we never see from hanging.
+    // The armed bits are read before the values, so every acknowledged refresh sees values at
+    // least as new as the client's request. Read after the values, a refresh armed in between
+    // (nn::gs::TryWaitNativeSync after a slot event fired) was answered with the old value: the
+    // movie player's frame callback then found its fence unreached and aborted (2162-0001).
+    // EDEN_NX2_SYNCPT_ACK_SNAPSHOT=0 restores the old order.
     void PollSyncpts() {
         if (m_syncpt_memory == nullptr) {
             return;
         }
-        UpdateSyncptValues();
+        static const bool snapshot = [] {
+            const char* value = std::getenv("EDEN_NX2_SYNCPT_ACK_SNAPSHOT");
+            return value == nullptr || value[0] != '0';
+        }();
+        const u32 words = (std::min)((m_syncpt_count + 63) / 64, 0x40U);
+        std::array<u64, 0x40> rw_bits{};
+        u64 rw_summary{};
+        const auto read_armed = [&] {
+            for (u32 w = 0; w < words; ++w) {
+                rw_bits[w] = m_syncpt_memory->Read64(m_syncpt_rw + SyncptRwBitsOffset + w * 8);
+            }
+            rw_summary = m_syncpt_memory->Read64(m_syncpt_rw + SyncptRwSummaryOffset);
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+        };
+        if (snapshot) {
+            read_armed();
+            SyncptPollTestDelay();
+            UpdateSyncptValues();
+        } else {
+            UpdateSyncptValues();
+            SyncptPollTestDelay();
+            read_armed();
+        }
         bool acked = false;
-        const u32 words = (m_syncpt_count + 63) / 64;
         for (u32 w = 0; w < words; ++w) {
-            const u64 rw_bits = m_syncpt_memory->Read64(m_syncpt_rw + SyncptRwBitsOffset + w * 8);
             const u64 ro_address = m_syncpt_ro + SyncptRoBitsOffset + w * 8;
-            if (m_syncpt_memory->Read64(ro_address) != rw_bits) {
-                m_syncpt_memory->Write64(ro_address, rw_bits);
+            const u64 ro_bits = m_syncpt_memory->Read64(ro_address);
+            if (ro_bits != rw_bits[w]) {
+                m_syncpt_memory->Write64(ro_address, rw_bits[w]);
                 acked = true;
+                if (Nx2SyncptTraceOn()) {
+                    for (u64 bits = ro_bits ^ rw_bits[w]; bits != 0; bits &= bits - 1) {
+                        const u32 id = w * 64 + static_cast<u32>(std::countr_zero(bits));
+                        Nx2SyncptTraceAdd(
+                            "refresh ack", 0, id,
+                            m_syncpt_memory->Read64(m_syncpt_ro + SyncptValuesOffset + id * 8),
+                            id < HostSyncpoints ? system.Host1x()
+                                                      .GetSyncpointManager()
+                                                      .GetGuestSyncpointValue(id)
+                                                : 0);
+                    }
+                }
             }
         }
-        m_syncpt_memory->Write64(m_syncpt_ro + SyncptRoSummaryOffset,
-                                 m_syncpt_memory->Read64(m_syncpt_rw + SyncptRwSummaryOffset));
+        m_syncpt_memory->Write64(m_syncpt_ro + SyncptRoSummaryOffset, rw_summary);
         if (acked) {
             m_syncpt_events[1]->Signal(system.Kernel());
+        }
+    }
+
+    // EDEN_NX2_SYNCPT_POLL_DELAY_US=<n> (test only): every 8th poll stalls n microseconds between
+    // reading the armed bits and the values, as a preempted timer thread would.
+    void SyncptPollTestDelay() {
+        static const u32 delay = [] {
+            const char* value = std::getenv("EDEN_NX2_SYNCPT_POLL_DELAY_US");
+            return value ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : 0U;
+        }();
+        if (delay == 0 || (++m_syncpt_polls & 7) != 0) {
+            return;
+        }
+        const auto until = std::chrono::steady_clock::now() + std::chrono::microseconds{delay};
+        while (std::chrono::steady_clock::now() < until) {
         }
     }
 
@@ -3811,6 +3864,7 @@ private:
     u64 m_syncpt_rw{};
     u64 m_syncpt_ro{};
     u32 m_syncpt_count{};
+    u32 m_syncpt_polls{};
     std::shared_ptr<Core::Timing::EventType> m_syncpt_poll;
 };
 
