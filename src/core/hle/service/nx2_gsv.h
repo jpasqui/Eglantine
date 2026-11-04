@@ -31,6 +31,7 @@
 #include "common/thread.h"
 #include "core/core.h"
 #include "core/device_memory.h"
+#include "core/hle/service/nx2_syncpt_trace.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_base.h"
 #include "video_core/nx2_vol_trace.h"
@@ -192,11 +193,13 @@ private:
                               ? system.Host1x().GetSyncpointManager().GetGuestSyncpointValue(syncpoint)
                               : 0;
         LOG_DEBUG(Service, "nx2:syncpt 103 syncpoint={} value={:#x}", syncpoint, value);
+        Nx2SyncptTraceAdd("query 103", 0, syncpoint, value, value);
         TipcReplyWords(ctx, {static_cast<u32>(value), static_cast<u32>(value >> 32), 0});
     }
 
     void GetSlotEvent(HLERequestContext& ctx) {
         const u32 slot = ctx.CommandBuffer()[2];
+        Nx2SyncptTraceAdd("slot event 22", slot, 0, 0, 0);
         LOG_WARNING(Service, "(STUBBED) nx2:syncpt TIPC 22 slot={:#x}, returning an event", slot);
         auto*& event = m_events[slot];
         if (event == nullptr) {
@@ -241,7 +244,10 @@ private:
             return;
         }
         auto& request = m_requests[slot];
-        Cancel(request);
+        const bool was_pending = Cancel(request);
+        Nx2SyncptTraceAdd("request 201", slot, syncpoint, value,
+                          system.Host1x().GetSyncpointManager().GetGuestSyncpointValue(syncpoint),
+                          mode | (was_pending ? 0x100U : 0U));
         // A new request starts unsignalled. Slots are reused by different client objects: title 1's
         // movie player got slot 0 after NVN's fence waits had left it signalled, took that as a
         // decoded frame and aborted when the decoder had none.
@@ -253,12 +259,13 @@ private:
         // already reached.
         request.handle = manager.RegisterGuestAction(
             syncpoint, static_cast<u32>(value),
-            [shared = m_shared, &kernel = system.Kernel(), &request, event] {
+            [shared = m_shared, &kernel = system.Kernel(), &request, event, slot, syncpoint, value] {
                 std::scoped_lock lk{shared->mutex};
                 if (!shared->alive) {
                     return;
                 }
                 request.pending = false;
+                Nx2SyncptTraceAdd("fired", slot, syncpoint, value, 0);
                 event->Signal(kernel);
             });
         TipcReplyWords(ctx, {});
@@ -267,9 +274,11 @@ private:
     void CancelSlotEvent(HLERequestContext& ctx) {
         const u32 slot = ctx.CommandBuffer()[2];
         LOG_DEBUG(Service, "nx2:syncpt TIPC 202 slot={:#x}", slot);
+        bool was_pending = false;
         if (auto it = m_requests.find(slot); it != m_requests.end()) {
-            Cancel(it->second);
+            was_pending = Cancel(it->second);
         }
+        Nx2SyncptTraceAdd("cancel 202", slot, 0, 0, 0, was_pending ? 1U : 0U);
         // nn::syncpt::sdk's cancel always waits on the slot's event after this reply, so a cancel
         // signals it like a completion, also when nothing was pending; the client rechecks the
         // counter (TIPC 103) itself. Title 1 hung forever there when the GPU thread ran a frame
@@ -2610,6 +2619,9 @@ private:
             }
             value = m_sync_base + ++m_handed;
         }
+        Nx2SyncptTraceAdd("vdec handout", image, m_syncpoint, value,
+                          system.Host1x().GetSyncpointManager().GetGuestSyncpointValue(m_syncpoint),
+                          release_fence ? release_fence->value : 0U);
         m_cv.notify_one();
         return {~m_syncpoint, 0, value, 0};
     }
@@ -2797,6 +2809,8 @@ private:
                     m_last_outputs.pop_front();
                 }
                 system.Host1x().GetSyncpointManager().IncrementGuest(m_syncpoint);
+                Nx2SyncptTraceAdd("vdec output", image, m_syncpoint, frame.pts,
+                                  system.Host1x().GetSyncpointManager().GetGuestSyncpointValue(m_syncpoint));
                 ++m_frames_out;
                 if (m_frames_out == 1 || (m_frames_out % 600) == 0 || frame.end) {
                     LOG_INFO(Service, "{} frame {} ({}x{}, pts {} us{}) in image {}",

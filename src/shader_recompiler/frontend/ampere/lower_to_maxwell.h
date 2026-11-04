@@ -1249,6 +1249,16 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             const bool shift_operand = constant ? valid_cbuf() && !insn.Bits(62, 2) : insn.words[1] <= 255;
             const auto load_shift = [&] { if (constant) materialize(2, 0, 251, false, false); };
             const bool right = insn.Bits(76, 1) != 0, high_result = insn.Bits(80, 1) != 0;
+            const u32 form_bits = insn.words[2] & ~(0x000118ffU | (opcode == 0xc19 ? 0x08000000U : 0U));
+            // SHF.R.S32.HI of the high word with a zero low word (round 23, the academy ground's vertex
+            // program): an arithmetic right shift of the high word, Maxwell SHR.S32 (wrap at 39, signed 48).
+            if (right && high_result && low == 255 && insn.Bits(73, 2) == 2 && shift != ~0U &&
+                shift_operand && form_bits == 0x00000400U) {
+                load_shift();
+                emit(base(0x5c28000000000000ULL) | (u64{high} << 8) | (u64{shift} << 20) |
+                     (u64{insn.Bits(75, 1)} << 39) | (u64{1} << 48));
+                break;
+            }
             // SHF.R.U32 of the low word with a zero high word: a plain logical right shift.
             if (right && !high_result && high == 255 && insn.Bits(73, 2) == 3 && shift != ~0U &&
                 shift_operand &&
@@ -1257,8 +1267,8 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                 emit(base(0x5c28000000000000ULL) | (u64{low} << 8) | (u64{shift} << 20));
                 break;
             }
-            if (!shift_operand || insn.Bits(73, 2) != 3 || shift == ~0U ||
-                (insn.words[2] & ~(0x000118ffU | (opcode == 0xc19 ? 0x08000000U : 0U))) != 0x00000600U ||
+            if (!shift_operand || shift == ~0U ||
+                insn.Bits(73, 2) != 3 || form_bits != 0x00000600U ||
                 (right ? (!high_result || low != 255) : (high_result || high != 255)))
                 return fail(index, "native register shift mode");
             load_shift();

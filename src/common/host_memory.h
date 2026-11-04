@@ -106,6 +106,9 @@ private:
     u8* virtual_base{};
     size_t virtual_base_offset{};
 
+    /// Windows, lazy commit: commits granules [first, end) of the backing memory.
+    void CommitGranules(size_t first, size_t end);
+
     static constexpr size_t GranuleShift = 16; ///< 64 KiB of backing per state byte
     static constexpr u8 GranuleUsed = 1 << 0;   ///< Handed out at least once
     static constexpr u8 GranuleDirty = 1 << 1;  ///< May hold non-zero data
@@ -113,6 +116,8 @@ private:
     size_t num_granules{};
     // Windows requires it for kernels whom lack proper support for some functions!
     bool fallback_buffer{false};
+    /// Windows: the backing memory is reserved and committed as the kernel hands pages out (MarkUsed).
+    bool lazy_commit{false};
 };
 
 } // namespace Common

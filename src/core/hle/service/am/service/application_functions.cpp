@@ -28,6 +28,7 @@
 #include "core/hle/service/glue/glue_manager.h"
 #include "core/hle/service/ns/application_manager_interface.h"
 #include "core/hle/service/ns/service_getter_interface.h"
+#include "core/hle/service/nx2_syncpt_trace.h"
 #include "core/hle/service/sm/sm.h"
 #include "core/loader/loader.h"
 
@@ -216,6 +217,9 @@ Result IApplicationFunctions::SetTerminateResult(Result terminate_result) {
              terminate_result.GetInnerValue(),
              static_cast<u32>(terminate_result.GetModule()) + 2000,
              terminate_result.GetDescription());
+
+    // EDEN_NX2_SYNCPT_TRACE: what the syncpoint waits looked like just before (nx2_syncpt_trace.h).
+    Nx2SyncptTraceDump("terminate result");
 
     std::scoped_lock lk{m_applet->lock};
     m_applet->terminate_result = terminate_result;
