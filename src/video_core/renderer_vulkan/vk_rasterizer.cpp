@@ -1425,9 +1425,7 @@ void RasterizerVulkan::InnerInvalidation(std::span<const std::pair<DAddr, std::s
     }
     {
         std::scoped_lock lock{buffer_cache.mutex};
-        for (const auto& [addr, size] : sequences) {
-            buffer_cache.WriteMemory(addr, size);
-        }
+        buffer_cache.WriteMemories(sequences);
     }
     for (const auto& [addr, size] : sequences) {
         query_cache.InvalidateRegion(addr, size);
@@ -1465,6 +1463,22 @@ void RasterizerVulkan::OnCacheInvalidation(DAddr addr, u64 size) {
         buffer_cache.WriteMemory(addr, size);
     }
     pipeline_cache.InvalidateRegion(addr, size);
+}
+
+void RasterizerVulkan::OnCacheInvalidations(std::span<const std::pair<DAddr, std::size_t>> ranges) {
+    {
+        std::scoped_lock lock{texture_cache.mutex};
+        for (const auto& [addr, size] : ranges) {
+            texture_cache.WriteMemory(addr, size);
+        }
+    }
+    {
+        std::scoped_lock lock{buffer_cache.mutex};
+        buffer_cache.WriteMemories(ranges);
+    }
+    for (const auto& [addr, size] : ranges) {
+        pipeline_cache.InvalidateRegion(addr, size);
+    }
 }
 
 bool RasterizerVulkan::TryCacheInvalidation(DAddr addr, u64 size) {

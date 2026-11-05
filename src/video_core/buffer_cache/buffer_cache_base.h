@@ -242,6 +242,10 @@ public:
     /// when the memory is going away).
     void WriteMemory(DAddr device_addr, u64 size, bool keep_page_gpu_data = true);
 
+    /// WriteMemory for ranges the CPU has already written, all at once: no range's page download
+    /// may overwrite what another range wrote. EDEN_NX2_BATCH_INVALIDATE=0: one by one.
+    void WriteMemories(std::span<const std::pair<DAddr, std::size_t>> ranges);
+
     void CachedWriteMemory(DAddr device_addr, u64 size);
 
     bool OnCPUWrite(DAddr device_addr, u64 size);

@@ -11,6 +11,7 @@
 #include <list>
 #include <memory>
 #include <utility>
+#include <vector>
 
 #include "common/assert.h"
 #include "common/settings.h"
@@ -115,10 +116,16 @@ struct GPU::Impl {
 
     /// Synchronizes CPU writes with Host GPU memory.
     void InvalidateGPUCache() {
-        std::function<void(PAddr, size_t)> callback_writes([this](PAddr address, size_t size) {
-            renderer->ReadRasterizer()->OnCacheInvalidation(address, size);
+        std::vector<std::pair<DAddr, std::size_t>> ranges;
+        std::function<void(PAddr, size_t)> callback_writes([&ranges](PAddr address, size_t size) {
+            if (address != 0 && size != 0) {
+                ranges.emplace_back(address, size);
+            }
         });
         system.GatherGPUDirtyMemory(callback_writes);
+        if (!ranges.empty()) {
+            renderer->ReadRasterizer()->OnCacheInvalidations(ranges);
+        }
     }
 
     /// Signal the ending of command list.

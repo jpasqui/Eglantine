@@ -25,6 +25,7 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/memory_manager.h"
+#include "video_core/nx2_pb_trace.h"
 #include "video_core/nx2_vol_trace.h"
 #include "video_core/shader_cache.h"
 #include "video_core/shader_environment.h"
@@ -222,6 +223,13 @@ bool ShaderCache::RefreshStages(std::array<u64, 6>& unique_hashes) try {
                                   "program {:#x} writes (first at {} ms, {} dispatches)",
                                   shader_addr, *cpu_shader_addr, written.gpu_addr, written.size, written.program,
                                   written.first_tick, written.dispatches);
+                    }
+                    // EDEN_NX2_DOWNLOAD_WATCH=1: cache downloads and uploads that changed its bytes.
+                    if (VideoCommon::Nx2PbTrace::DownloadWatch()) {
+                        const std::string writes{VideoCommon::Nx2PbTrace::ChangedWritesOverlapping(
+                            *cpu_shader_addr, 0x10000)};
+                        LOG_ERROR(HW_GPU, "Rejected program {:#x} (device {:#x}): emulator writes into it: {}",
+                                  shader_addr, *cpu_shader_addr, writes.empty() ? "none" : writes);
                     }
                 }
                 throw;

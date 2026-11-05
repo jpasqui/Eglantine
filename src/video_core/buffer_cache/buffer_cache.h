@@ -289,6 +289,30 @@ void BufferCache<P>::UnmapGPUMemory(size_t as_id, GPUVAddr gpu_addr, size_t size
 }
 
 template <class P>
+void BufferCache<P>::WriteMemories(std::span<const std::pair<DAddr, std::size_t>> ranges) {
+    // WriteMemory downloads the GPU-written bytes left on a written page. The CPU wrote these
+    // ranges before the gather, and several can share a page: the first range's download would
+    // write the GPU's older bytes over the others (the Pikmin 4 demo's native programs, loaded
+    // into memory the GPU wrote before, were captured with stretches of old data). Take every
+    // range out of the GPU-written set first.
+    static const bool batch = [] {
+        const char* value = std::getenv("EDEN_NX2_BATCH_INVALIDATE");
+        return value == nullptr || value[0] != '0';
+    }();
+    if (batch) {
+        for (const auto& [device_addr, size] : ranges) {
+            if (IsRegionGpuModified(device_addr, size)) {
+                ClearDownload(device_addr, size);
+                gpu_modified_ranges.Subtract(device_addr, size);
+            }
+        }
+    }
+    for (const auto& [device_addr, size] : ranges) {
+        WriteMemory(device_addr, size);
+    }
+}
+
+template <class P>
 void BufferCache<P>::WriteMemory(DAddr device_addr, u64 size, bool keep_page_gpu_data) {
     if (VideoCommon::Nx2VolTrace::HitsWrittenDeviceRange(device_addr, size)) {
         LOG_INFO(HW_GPU, "buffer trace: invalidate {:#x} size {:#x} gpu modified {}", device_addr,
