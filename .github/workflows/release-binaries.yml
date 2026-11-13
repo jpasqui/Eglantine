@@ -573,6 +573,12 @@ jobs:
     permissions:
       contents: write
     steps:
+      # The whole history and tags, for the patch notes since the previous build.
+      - name: Check out source
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
       - name: Download binaries
         uses: actions/download-artifact@v7
         with:
@@ -646,6 +652,12 @@ jobs:
           The PGO builds are the same programs compiled with profile-guided optimization (clang plus Eglantine's profile); prefer them when your CPU supports it.
           EOF
 
+          # Patch notes first, as the Discord post shows them.
+          bash .github/scripts/build-notes.sh "${GITHUB_REF_NAME}" "${tag}" > changes.md
+          { printf '## Changes\n\n'; cat changes.md; printf '\n'; cat notes.md; } > notes.tmp
+          mv notes.tmp notes.md
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+
           if ! compgen -G "dist/eglantine-macos-*" > /dev/null; then
             sed -i '/^## macOS$/,/^| arm64 /d' notes.md
             echo "No macOS build this time: its job did not finish." >> notes.md
@@ -678,9 +690,14 @@ jobs:
           if [ -z "$WEBHOOK" ]; then echo "No DISCORD_WEBHOOK_URL secret: not pinging"; exit 0; fi
           URL="https://github.com/${GITHUB_REPOSITORY}/releases/tag/build-${GITHUB_RUN_NUMBER}"
           if [ "$GITHUB_REPOSITORY" != "Djihads80/Eglantine" ]; then
-            URL="https://github.com/${GITHUB_REPOSITORY}/releases/tag/${GITHUB_REF_NAME}-build-${GITHUB_RUN_NUMBER}"
-            jq -n --arg content "Eglantine ${GITHUB_REF_NAME} build ${GITHUB_RUN_NUMBER} (${GITHUB_SHA::7}): ${URL}" \
-              '{content: $content, allowed_mentions: {parse: []}}' \
+            # An embed with the patch notes, as Tsuchi's and Kadan's release posts. Embed text stops at 4096.
+            URL="https://github.com/${GITHUB_REPOSITORY}/releases/tag/${{ steps.create.outputs.tag }}"
+            jq -n --rawfile notes changes.md \
+              --arg title "Eglantine ${GITHUB_REF_NAME} build ${GITHUB_RUN_NUMBER} (${GITHUB_SHA::7})" \
+              --arg url "$URL" --arg time "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg footer "$GITHUB_REPOSITORY" \
+              '{allowed_mentions: {parse: []}, embeds: [{title: $title, url: $url, timestamp: $time,
+                footer: {text: $footer},
+                description: (if ($notes | length) > 4000 then $notes[0:3990] + "\n…" else $notes end)}]}' \
             | curl -fsS -H "Content-Type: application/json" -d @- "$WEBHOOK"
             exit 0
           fi
