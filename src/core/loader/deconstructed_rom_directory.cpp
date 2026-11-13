@@ -415,6 +415,12 @@ AppLoader_DeconstructedRomDirectory::LoadResult AppLoader_DeconstructedRomDirect
         const FileSys::PatchManager patch_manager(
             metadata.GetTitleID(), system.GetFileSystemController(), system.GetContentProvider());
         dir = patch_manager.PatchExeFS(dir);
+    } else if (standalone) {
+        // A loose ExeFS is the program the user picked, so no installed update replaces it, but
+        // ExeFS mods in user/load/<titleid>/ still apply, as they do for NCA/NSP/XCI loads.
+        const FileSys::PatchManager patch_manager(
+            metadata.GetTitleID(), system.GetFileSystemController(), system.GetContentProvider());
+        dir = patch_manager.PatchExeFSMods(dir);
     }
 
     // Reread in case PatchExeFS affected the main.npdm

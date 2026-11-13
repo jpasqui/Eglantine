@@ -328,7 +328,29 @@ VirtualDir PatchManager::PatchExeFS(VirtualDir exefs) const {
         exefs = update->GetExeFS();
     }
 
-    // LayeredExeFS
+    exefs = LayerExeFSMods(std::move(exefs), disabled);
+
+    if (Settings::values.dump_exefs) {
+        LOG_INFO(Loader, "Dumping ExeFS for title_id={:016X}", title_id);
+        const auto dump_dir = fs_controller.GetModificationDumpRoot(title_id);
+        if (dump_dir != nullptr) {
+            const auto exefs_dir = GetOrCreateDirectoryRelative(dump_dir, "/exefs");
+            VfsRawCopyD(exefs, exefs_dir);
+        }
+    }
+
+    return exefs;
+}
+
+VirtualDir PatchManager::PatchExeFSMods(VirtualDir exefs) const {
+    if (exefs == nullptr)
+        return exefs;
+    LOG_INFO(Loader, "Patching loose ExeFS for title_id={:016X}", title_id);
+    return LayerExeFSMods(std::move(exefs), GetDisabledAddons());
+}
+
+VirtualDir PatchManager::LayerExeFSMods(VirtualDir exefs,
+                                        const std::vector<std::string>& disabled) const {
     const auto load_dir = GetModificationLoadRoot();
     const auto sdmc_load_dir = GetModificationLoadRoot(true);
 
@@ -357,15 +379,6 @@ VirtualDir PatchManager::PatchExeFS(VirtualDir exefs) const {
     if (layered != nullptr) {
         LOG_INFO(Loader, "    ExeFS: LayeredExeFS patches applied successfully");
         exefs = std::move(layered);
-    }
-
-    if (Settings::values.dump_exefs) {
-        LOG_INFO(Loader, "Dumping ExeFS for title_id={:016X}", title_id);
-        const auto dump_dir = fs_controller.GetModificationDumpRoot(title_id);
-        if (dump_dir != nullptr) {
-            const auto exefs_dir = GetOrCreateDirectoryRelative(dump_dir, "/exefs");
-            VfsRawCopyD(exefs, exefs_dir);
-        }
     }
 
     return exefs;
