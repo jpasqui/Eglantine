@@ -168,18 +168,6 @@ AppLoader_NUP::AppLoader_NUP(FileSys::VirtualFile file_)
                 program.localized_icons.front().second, "icon.dat");
         }
     }
-
-    const auto addon_count = std::count_if(nup->GetPackages().begin(), nup->GetPackages().end(),
-                                           [](const auto& package) {
-                                               return package.kind ==
-                                                      NupContainer::PackageKind::Addon;
-                                           });
-    if (addon_count > 0) {
-        LOG_WARNING(Loader,
-                    "NUP container has {} add-on content package(s); AoC mounting is not "
-                    "supported yet",
-                    addon_count);
-    }
 }
 
 AppLoader_NUP::~AppLoader_NUP() = default;
@@ -208,6 +196,16 @@ AppLoader::LoadResult AppLoader_NUP::Load(Kernel::KProcess& process, Core::Syste
         process.GetProcessId(), base_title_id,
         std::make_shared<FileSys::RomFSFactory>(*this, system.GetContentProvider(),
                                                 system.GetFileSystemController()));
+
+    // Add-ons are served from their RomFS folders; packages are in name order, so the last
+    // package of a title is its newest version.
+    for (std::size_t i = 0; i < nup->GetPackages().size(); ++i) {
+        const auto& package = nup->GetPackages()[i];
+        if (package.kind == NupContainer::PackageKind::Addon) {
+            system.GetFileSystemController().RegisterDumpAddOn(package.title_id,
+                                                               nup->GetRomFSDir(i));
+        }
+    }
 
     is_loaded = true;
     return result;

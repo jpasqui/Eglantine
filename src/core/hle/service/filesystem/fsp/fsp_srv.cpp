@@ -516,6 +516,11 @@ Result FSP_SRV::OpenDataStorageByDataId(OutInterface<IStorage> out_interface,
     auto data = romfs_controller->OpenRomFS(title_id, storage_id, FileSys::ContentRecordType::Data);
 
     if (!data) {
+        if (auto dump_addon = fsc.OpenDumpAddOn(title_id)) {
+            *out_interface = std::make_shared<IStorage>(system, std::move(dump_addon));
+            R_SUCCEED();
+        }
+
         const auto archive = FileSys::SystemArchive::SynthesizeSystemArchive(title_id);
 
         if (archive != nullptr) {

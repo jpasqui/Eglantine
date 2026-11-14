@@ -6,8 +6,10 @@
 
 #pragma once
 
+#include <map>
 #include <memory>
 #include <mutex>
+#include <vector>
 #include "common/common_types.h"
 #include "core/file_sys/fs_directory.h"
 #include "core/file_sys/fs_filesystem.h"
@@ -129,9 +131,19 @@ public:
 
     void InitTempStorage();
 
+    // Add-ons from a console dump (dlc/<title id>/<version>/romfs), given as folders instead of
+    // installed NCAs. The loose and NUP loaders register them; aoc lists them, fsp serves them.
+    void RegisterDumpAddOn(u64 title_id, FileSys::VirtualDir romfs);
+    std::vector<u64> ListDumpAddOns() const;
+    FileSys::VirtualFile OpenDumpAddOn(u64 title_id);
+
     void Reset();
 
 private:
+    mutable std::mutex dump_addon_lock;
+    std::map<u64, FileSys::VirtualDir> dump_addons;
+    std::map<u64, FileSys::VirtualFile> dump_addon_romfs;
+
     std::shared_ptr<FileSys::SaveDataFactory> CreateSaveDataFactory(ProgramId program_id);
 
     struct Registration {

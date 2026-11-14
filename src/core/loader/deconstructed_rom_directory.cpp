@@ -280,6 +280,61 @@ std::vector<FileSys::VirtualDir> FindSidecarDirs(const FileSys::VirtualDir& exef
     return dirs;
 }
 
+bool NameIs(const std::string& name, std::string_view expected) {
+    return name.size() == expected.size() &&
+           std::equal(name.begin(), name.end(), expected.begin(), [](char a, char b) {
+               return std::tolower(static_cast<unsigned char>(a)) == b;
+           });
+}
+
+// A console dump keeps its add-ons beside the program: <dump>/dlc/<title id>/<version>/romfs,
+// next to <dump>/base and <dump>/updates/<version>. Registers the newest version of each.
+void RegisterDumpAddOns(Core::System& system, const FileSys::VirtualDir& exefs_dir) {
+    const auto program_dir = exefs_dir != nullptr ? exefs_dir->GetParentDirectory() : nullptr;
+    if (program_dir == nullptr) {
+        return;
+    }
+    FileSys::VirtualDir dump_root = program_dir;
+    if (const auto parent = program_dir->GetParentDirectory()) {
+        if (NameIs(program_dir->GetName(), "base")) {
+            dump_root = parent;
+        } else if (NameIs(parent->GetName(), "updates")) {
+            dump_root = parent->GetParentDirectory();
+        }
+    }
+    const auto dlc = dump_root != nullptr ? dump_root->GetSubdirectory("dlc") : nullptr;
+    if (dlc == nullptr) {
+        return;
+    }
+    for (const auto& title : dlc->GetSubdirectories()) {
+        const auto name = title->GetName();
+        u64 title_id{};
+        const auto parsed = std::from_chars(name.data(), name.data() + name.size(), title_id, 16);
+        if (name.size() != 16 || parsed.ec != std::errc{} ||
+            parsed.ptr != name.data() + name.size() || (title_id & 0xFFF) == 0) {
+            continue;
+        }
+        FileSys::VirtualDir newest{};
+        u64 newest_version{};
+        for (const auto& version_dir : title->GetSubdirectories()) {
+            const auto version_name = version_dir->GetName();
+            u64 version{};
+            const auto version_parsed = std::from_chars(
+                version_name.data(), version_name.data() + version_name.size(), version);
+            if (version_parsed.ec != std::errc{} ||
+                version_parsed.ptr != version_name.data() + version_name.size()) {
+                continue;
+            }
+            const auto romfs = FindLooseRomFSDirectory(version_dir);
+            if (romfs != nullptr && (newest == nullptr || version >= newest_version)) {
+                newest = romfs;
+                newest_version = version;
+            }
+        }
+        system.GetFileSystemController().RegisterDumpAddOn(title_id, newest);
+    }
+}
+
 } // namespace
 
 AppLoader_DeconstructedRomDirectory::AppLoader_DeconstructedRomDirectory(FileSys::VirtualFile file_, bool override_update_)
@@ -539,6 +594,7 @@ AppLoader_DeconstructedRomDirectory::LoadResult AppLoader_DeconstructedRomDirect
             process.GetProcessId(), metadata.GetTitleID(),
             std::make_shared<FileSys::RomFSFactory>(*this, system.GetContentProvider(),
                                                     system.GetFileSystemController()));
+        RegisterDumpAddOns(system, dir);
     }
 
     is_loaded = true;

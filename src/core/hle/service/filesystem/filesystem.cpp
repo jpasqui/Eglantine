@@ -18,6 +18,7 @@
 #include "core/file_sys/errors.h"
 #include "core/file_sys/patch_manager.h"
 #include "core/file_sys/registered_cache.h"
+#include "core/file_sys/romfs.h"
 #include "core/file_sys/romfs_factory.h"
 #include "core/file_sys/savedata_factory.h"
 #include "core/file_sys/sdmc_factory.h"
@@ -794,7 +795,44 @@ void FileSystemController::InitTempStorage() {
     }
 }
 
+void FileSystemController::RegisterDumpAddOn(u64 title_id, FileSys::VirtualDir romfs) {
+    if (romfs == nullptr) {
+        return;
+    }
+    LOG_INFO(Service_FS, "Add-on {:016X} from the dump folder {}", title_id, romfs->GetFullPath());
+    std::scoped_lock lk{dump_addon_lock};
+    dump_addons[title_id] = std::move(romfs);
+    dump_addon_romfs.erase(title_id);
+}
+
+std::vector<u64> FileSystemController::ListDumpAddOns() const {
+    std::scoped_lock lk{dump_addon_lock};
+    std::vector<u64> out;
+    for (const auto& [title_id, romfs] : dump_addons) {
+        out.push_back(title_id);
+    }
+    return out;
+}
+
+FileSys::VirtualFile FileSystemController::OpenDumpAddOn(u64 title_id) {
+    std::scoped_lock lk{dump_addon_lock};
+    const auto it = dump_addons.find(title_id);
+    if (it == dump_addons.end()) {
+        return nullptr;
+    }
+    auto& romfs = dump_addon_romfs[title_id];
+    if (romfs == nullptr) {
+        romfs = FileSys::CreateRomFS(it->second);
+    }
+    return romfs;
+}
+
 void FileSystemController::Reset() {
+    {
+        std::scoped_lock lk{dump_addon_lock};
+        dump_addons.clear();
+        dump_addon_romfs.clear();
+    }
     std::scoped_lock lk{registration_lock};
     registrations.clear();
 }
