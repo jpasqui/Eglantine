@@ -21,6 +21,7 @@
 #include "core/hle/service/aoc/addon_content_manager.h"
 #include "core/hle/service/aoc/purchase_event_manager.h"
 #include "core/hle/service/cmif_serialization.h"
+#include "core/hle/service/filesystem/filesystem.h"
 #include "core/hle/service/ipc_helpers.h"
 #include "core/hle/service/server_manager.h"
 #include "core/hle/service/am/am_results.h"
@@ -30,6 +31,34 @@ namespace Service::AOC {
 
 static bool CheckAOCTitleIDMatchesBase(u64 title_id, u64 base) {
     return FileSys::GetBaseTitleID(title_id) == base;
+}
+
+// A Switch 2 Edition program has its own ID, 04 in the top byte, but its add-ons belong to the
+// Switch 1 application, 01 in the top byte. Gives the Switch 1 base ID for a Switch 2 one.
+static u64 GetSwitch1ApplicationID(u64 base_title_id) {
+    constexpr u64 platform_mask = 0xFF00000000000000;
+    constexpr u64 switch2_platform = 0x0400000000000000;
+    constexpr u64 switch1_platform = 0x0100000000000000;
+    if ((base_title_id & platform_mask) != switch2_platform) {
+        return base_title_id;
+    }
+    return (base_title_id & ~platform_mask) | switch1_platform;
+}
+
+// The base ID the caller's add-ons are installed under: the program's own, or the Switch 1
+// application's when only that one has add-ons installed.
+static u64 GetCallerAddOnBaseTitleID(Core::System& system, const ClientProcessId& process_id,
+                                     const std::vector<u64>& add_on_content) {
+    const auto own = FileSys::GetBaseTitleID(system.ResolveCallerProgramId(*process_id));
+    const auto switch1 = GetSwitch1ApplicationID(own);
+    if (switch1 == own) {
+        return own;
+    }
+    const auto has_add_ons = [&add_on_content](u64 base) {
+        return std::any_of(add_on_content.begin(), add_on_content.end(),
+                           [base](u64 tid) { return CheckAOCTitleIDMatchesBase(tid, base); });
+    };
+    return !has_add_ons(own) && has_add_ons(switch1) ? switch1 : own;
 }
 
 static u64 GetCallerBaseTitleID(Core::System& system, const ClientProcessId& process_id) {
@@ -51,6 +80,18 @@ static std::vector<u64> AccumulateAOCTitleIDs(Core::System& system) {
                        Loader::ResultStatus::Success;
             }),
         add_on_content.end());
+    return add_on_content;
+}
+
+// The installed add-ons plus those a console dump brought as folders. The dump's are registered
+// when the game loads, after this service has listed the installed ones.
+static std::vector<u64> WithDumpAddOns(Core::System& system, std::vector<u64> add_on_content) {
+    for (const u64 title_id : system.GetFileSystemController().ListDumpAddOns()) {
+        if (std::find(add_on_content.begin(), add_on_content.end(), title_id) ==
+            add_on_content.end()) {
+            add_on_content.push_back(title_id);
+        }
+    }
     return add_on_content;
 }
 
@@ -104,9 +145,12 @@ Result IAddOnContentManager::CountAddOnContent(Out<u32> out_count, ClientProcess
         R_SUCCEED();
     }
 
+    const auto all = WithDumpAddOns(system, add_on_content);
+    const auto add_on_base = GetCallerAddOnBaseTitleID(system, process_id, all);
     *out_count = static_cast<u32>(
-        std::count_if(add_on_content.begin(), add_on_content.end(),
-                      [current](u64 tid) { return CheckAOCTitleIDMatchesBase(tid, current); }));
+        std::count_if(all.begin(), all.end(), [add_on_base](u64 tid) {
+            return CheckAOCTitleIDMatchesBase(tid, add_on_base);
+        }));
 
     R_SUCCEED();
 }
@@ -122,8 +166,10 @@ Result IAddOnContentManager::ListAddOnContent(Out<u32> out_count,
     std::vector<u32> out;
     const auto& disabled = Settings::values.disabled_addons[current];
     if (std::find(disabled.begin(), disabled.end(), "DLC") == disabled.end()) {
-        for (u64 content_id : add_on_content) {
-            if (FileSys::GetBaseTitleID(content_id) != current) {
+        const auto all = WithDumpAddOns(system, add_on_content);
+        const auto add_on_base = GetCallerAddOnBaseTitleID(system, process_id, all);
+        for (u64 content_id : all) {
+            if (FileSys::GetBaseTitleID(content_id) != add_on_base) {
                 continue;
             }
 
@@ -150,8 +196,9 @@ Result IAddOnContentManager::GetAddOnContentBaseId(Out<u64> out_title_id,
                                    system.GetContentProvider()};
 
     const auto res = pm.GetControlMetadata();
-    if (res.first == nullptr) {
-        *out_title_id = FileSys::GetAOCBaseTitleID(title_id);
+    if (res.first == nullptr || res.first->GetDLCBaseTitleId() == 0) {
+        *out_title_id = FileSys::GetAOCBaseTitleID(GetCallerAddOnBaseTitleID(
+            system, process_id, WithDumpAddOns(system, add_on_content)));
         R_SUCCEED();
     }
 
