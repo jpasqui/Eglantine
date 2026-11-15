@@ -280,10 +280,25 @@ std::vector<FileSys::VirtualDir> FindSidecarDirs(const FileSys::VirtualDir& exef
     return dirs;
 }
 
-// A console dump keeps its add-ons beside the program: <dump>/dlc/<title id>/<version>/romfs,
-// next to OunceCake's <dump>/program/<version>, or <dump>/base and <dump>/updates/<version>.
-// The dlc folder is searched from the program's folder up to two levels above it. Registers
-// the newest version of each add-on.
+// An add-on version's romfs: <version>/romfs, or nested as OunceCake writes it,
+// <version>/base/program/0/romfs. Searches up to `depth` folders down.
+FileSys::VirtualDir FindAddOnRomFSDirectory(const FileSys::VirtualDir& dir, int depth) {
+    if (const auto romfs = FindLooseRomFSDirectory(dir); romfs != nullptr || depth == 0) {
+        return romfs;
+    }
+    for (const auto& subdir : dir->GetSubdirectories()) {
+        if (const auto romfs = FindAddOnRomFSDirectory(subdir, depth - 1)) {
+            return romfs;
+        }
+    }
+    return nullptr;
+}
+
+// A console dump keeps its add-ons beside the program: <dump>/dlc/<title id>/<version>/...romfs.
+// OunceCake writes the game as <dump>/base/program/0 and <dump>/updates/<version>/program/0;
+// other dumps use <dump>/base, <dump>/updates/<version> or <dump>/program/<version>. The dlc
+// folder is searched from the program's folder up to four levels above it. Registers the newest
+// version of each add-on.
 void RegisterDumpAddOns(Core::System& system, const FileSys::VirtualDir& exefs_dir) {
     const auto program_dir = exefs_dir != nullptr ? exefs_dir->GetParentDirectory() : nullptr;
     if (program_dir == nullptr) {
@@ -291,12 +306,12 @@ void RegisterDumpAddOns(Core::System& system, const FileSys::VirtualDir& exefs_d
     }
     FileSys::VirtualDir dlc{};
     auto dir = program_dir;
-    for (int level = 0; level < 3 && dir != nullptr && dlc == nullptr; ++level) {
+    for (int level = 0; level < 5 && dir != nullptr && dlc == nullptr; ++level) {
         dlc = dir->GetSubdirectory("dlc");
         dir = dir->GetParentDirectory();
     }
     if (dlc == nullptr) {
-        LOG_INFO(Loader, "No dlc folder in or up to two folders above {}",
+        LOG_INFO(Loader, "No dlc folder in or up to four folders above {}",
                  program_dir->GetFullPath());
         return;
     }
@@ -319,14 +334,14 @@ void RegisterDumpAddOns(Core::System& system, const FileSys::VirtualDir& exefs_d
                 version_parsed.ptr != version_name.data() + version_name.size()) {
                 continue;
             }
-            const auto romfs = FindLooseRomFSDirectory(version_dir);
+            const auto romfs = FindAddOnRomFSDirectory(version_dir, 3);
             if (romfs != nullptr && (newest == nullptr || version >= newest_version)) {
                 newest = romfs;
                 newest_version = version;
             }
         }
         if (newest == nullptr) {
-            LOG_INFO(Loader, "Add-on folder {} has no <version>/romfs folder",
+            LOG_INFO(Loader, "Add-on folder {} has no romfs folder under a <version> folder",
                      title->GetFullPath());
             continue;
         }
