@@ -589,7 +589,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mkdir dist
+          # Not dist: the checkout has a dist folder of icons and desktop files.
+          mkdir release-files
           # Asset names drop the commit sha: the release tag already identifies the build, and
           # stable names let the notes table link to them.
           strip_sha() { sed "s/-${GITHUB_SHA}//" <<< "$1"; }
@@ -598,17 +599,17 @@ jobs:
             if compgen -G "$artifact*.AppImage" > /dev/null; then
               # Linux: ship the AppImage and the tar.gz as they are.
               for file in "$artifact"*.AppImage "$artifact"*.tar.gz; do
-                cp "$file" "dist/$(strip_sha "$(basename "$file")")"
+                cp "$file" "release-files/$(strip_sha "$(basename "$file")")"
               done
             elif compgen -G "$artifact*.zip" > /dev/null; then
               for file in "$artifact"*.zip "$artifact"*.dmg; do
-                [[ -e "$file" ]] && cp "$file" "dist/$(strip_sha "$(basename "$file")")"
+                [[ -e "$file" ]] && cp "$file" "release-files/$(strip_sha "$(basename "$file")")"
               done
             else
-              (cd "$artifact" && zip -qr "${GITHUB_WORKSPACE}/dist/$(strip_sha "$name").zip" .)
+              (cd "$artifact" && zip -qr "${GITHUB_WORKSPACE}/release-files/$(strip_sha "$name").zip" .)
             fi
           done
-          ls -la dist
+          ls -la release-files
 
       - name: Create release
         id: create
@@ -658,20 +659,20 @@ jobs:
           mv notes.tmp notes.md
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
 
-          if ! compgen -G "dist/eglantine-macos-*" > /dev/null; then
+          if ! compgen -G "release-files/eglantine-macos-*" > /dev/null; then
             sed -i '/^## macOS$/,/^| arm64 /d' notes.md
             echo "No macOS build this time: its job did not finish." >> notes.md
           fi
-          test -n "$(ls dist)"
+          test -n "$(ls release-files)"
 
           # A re-run of the failed jobs (GitHub's macOS arm64 runners often aren't acquired in time)
           # keeps the run number, so it adds its files to the release the first attempt made.
           if gh release view "${tag}" --repo "${GITHUB_REPOSITORY}" > /dev/null 2>&1; then
-            gh release upload "${tag}" dist/* --repo "${GITHUB_REPOSITORY}" --clobber
+            gh release upload "${tag}" release-files/* --repo "${GITHUB_REPOSITORY}" --clobber
             gh release edit "${tag}" --repo "${GITHUB_REPOSITORY}" --notes-file notes.md
             echo "created=false" >> "$GITHUB_OUTPUT"
           else
-            gh release create "${tag}" dist/* \
+            gh release create "${tag}" release-files/* \
               --repo "${GITHUB_REPOSITORY}" \
               --target "${GITHUB_SHA}" \
               --prerelease \
