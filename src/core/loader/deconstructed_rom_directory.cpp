@@ -280,30 +280,24 @@ std::vector<FileSys::VirtualDir> FindSidecarDirs(const FileSys::VirtualDir& exef
     return dirs;
 }
 
-bool NameIs(const std::string& name, std::string_view expected) {
-    return name.size() == expected.size() &&
-           std::equal(name.begin(), name.end(), expected.begin(), [](char a, char b) {
-               return std::tolower(static_cast<unsigned char>(a)) == b;
-           });
-}
-
 // A console dump keeps its add-ons beside the program: <dump>/dlc/<title id>/<version>/romfs,
-// next to <dump>/base and <dump>/updates/<version>. Registers the newest version of each.
+// next to OunceCake's <dump>/program/<version>, or <dump>/base and <dump>/updates/<version>.
+// The dlc folder is searched from the program's folder up to two levels above it. Registers
+// the newest version of each add-on.
 void RegisterDumpAddOns(Core::System& system, const FileSys::VirtualDir& exefs_dir) {
     const auto program_dir = exefs_dir != nullptr ? exefs_dir->GetParentDirectory() : nullptr;
     if (program_dir == nullptr) {
         return;
     }
-    FileSys::VirtualDir dump_root = program_dir;
-    if (const auto parent = program_dir->GetParentDirectory()) {
-        if (NameIs(program_dir->GetName(), "base")) {
-            dump_root = parent;
-        } else if (NameIs(parent->GetName(), "updates")) {
-            dump_root = parent->GetParentDirectory();
-        }
+    FileSys::VirtualDir dlc{};
+    auto dir = program_dir;
+    for (int level = 0; level < 3 && dir != nullptr && dlc == nullptr; ++level) {
+        dlc = dir->GetSubdirectory("dlc");
+        dir = dir->GetParentDirectory();
     }
-    const auto dlc = dump_root != nullptr ? dump_root->GetSubdirectory("dlc") : nullptr;
     if (dlc == nullptr) {
+        LOG_INFO(Loader, "No dlc folder in or up to two folders above {}",
+                 program_dir->GetFullPath());
         return;
     }
     for (const auto& title : dlc->GetSubdirectories()) {
@@ -330,6 +324,11 @@ void RegisterDumpAddOns(Core::System& system, const FileSys::VirtualDir& exefs_d
                 newest = romfs;
                 newest_version = version;
             }
+        }
+        if (newest == nullptr) {
+            LOG_INFO(Loader, "Add-on folder {} has no <version>/romfs folder",
+                     title->GetFullPath());
+            continue;
         }
         system.GetFileSystemController().RegisterDumpAddOn(title_id, newest);
     }
@@ -454,6 +453,9 @@ AppLoader_DeconstructedRomDirectory::LoadResult AppLoader_DeconstructedRomDirect
 
         dir = file->GetContainingDirectory();
     }
+    // The folder on disk, before ExeFS mods are layered over it: a layered folder's parent is the
+    // first mod's folder, not the dump's.
+    const FileSys::VirtualDir loose_dir = dir;
 
     // Read meta to determine title ID
     FileSys::VirtualFile npdm = dir->GetFile("main.npdm");
@@ -594,7 +596,7 @@ AppLoader_DeconstructedRomDirectory::LoadResult AppLoader_DeconstructedRomDirect
             process.GetProcessId(), metadata.GetTitleID(),
             std::make_shared<FileSys::RomFSFactory>(*this, system.GetContentProvider(),
                                                     system.GetFileSystemController()));
-        RegisterDumpAddOns(system, dir);
+        RegisterDumpAddOns(system, loose_dir);
     }
 
     is_loaded = true;
